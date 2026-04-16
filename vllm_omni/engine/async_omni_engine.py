@@ -424,22 +424,23 @@ class AsyncOmniEngine:
                                 proc=proc,
                             )
                         logger.info("[AsyncOmniEngine] Stage %s engine launch started", metadata.stage_id)
-                        # Keep the stage-specific device visibility until vLLM
-                        # finishes starting all child processes.
-                        if self.single_stage_mode and self._omni_master_server is not None:
-                            launch_stack.close()
-                        else:
-                            assert proc is not None
-                            assert handshake_address is not None
-                            complete_stage_handshake(
-                                proc, handshake_address, addresses, vllm_config, stage_init_timeout
-                            )
-                        logger.info("[AsyncOmniEngine] Stage %s engine startup completed", metadata.stage_id)
                     finally:
                         if previous_visible_devices is None:
                             current_omni_platform.unset_device_control_env_var()
                         else:
                             current_omni_platform.set_device_control_env_var(previous_visible_devices)
+
+                # After StageEngineCoreProc has been spawned it carries its
+                # stage-specific device visibility into descendants, so the
+                # slow HELLO/READY handshake can run without holding the
+                # process-wide launch lock.
+                if self.single_stage_mode and self._omni_master_server is not None:
+                    launch_stack.close()
+                else:
+                    assert proc is not None
+                    assert handshake_address is not None
+                    complete_stage_handshake(proc, handshake_address, addresses, vllm_config, stage_init_timeout)
+                logger.info("[AsyncOmniEngine] Stage %s engine startup completed", metadata.stage_id)
 
             assert started_stage is not None
             return started_stage
@@ -758,12 +759,14 @@ class AsyncOmniEngine:
                                         self._omni_master_server,
                                     )
                                 else:
+                                    use_inline = True if self.num_stages == 1 else False
                                     stage_clients[stage_idx] = initialize_diffusion_stage(
                                         self.model,
                                         stage_cfg,
                                         metadata,
                                         stage_init_timeout=stage_init_timeout,
                                         batch_size=self.diffusion_batch_size,
+                                        use_inline=use_inline,
                                     )
                                 logger.info(
                                     "[AsyncOmniEngine] Stage %s initialized (diffusion, batch_size=%d)",
