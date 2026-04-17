@@ -274,7 +274,7 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         # device until the weight loader materializes them. Calling
         # .to(device) would fail on those meta tensors, so we skip it
         # entirely and let the weight loader handle device placement.
-        if quant_config is None and not (od_config.enable_layerwise_offload):
+        if quant_config is None and not od_config.enable_layerwise_offload:
             self.to(self.device)
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=self.od_config.enable_diffusion_pipeline_profiler
@@ -918,6 +918,11 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         return loader.load_weights(_filtered_weights())
 
     def discover_offload_modules(self) -> PipelineModules:
+        if self.bagel is None:
+            raise ValueError("Bagel is not initialized")
+        if self.language_model is None:
+            raise ValueError("Bagel language model is not initialized")
+
         resident_modules: list[nn.Module] = []
         resident_names: list[str] = []
 

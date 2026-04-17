@@ -110,7 +110,7 @@ layout, the pipeline can provide a custom `discover_offload_modules()` implement
 
 Bagel is one such example. Its transformer blocks live under `language_model.model`, while
 several Bagel-specific modules (such as `time_embedder`, `vae2llm`, `llm2vae`, `vit_model`, etc.)
-should remain resident on GPU during layerwise offloading. Register
+should remain resident on GPU.
 
 ```python
 class Qwen2MoTModel(...):
@@ -121,15 +121,22 @@ Then, implement discover_offload_modules() on the BagelPipeline to tell the offl
 
 ```python
 def discover_offload_modules(self) -> PipelineModules:
-    resident_modules = [
-        self.bagel.time_embedder,
-        self.bagel.vae2llm,
-        self.bagel.llm2vae,
-        self.bagel.latent_pos_embed,
-        self.bagel.vit_model,
-        self.bagel.connector,
-        self.bagel.vit_pos_embed,
-    ]
+    resident_modules: list[nn.Module] = []
+    resident_names: list[str] = []
+
+    def add_resident(name: str, module: nn.Module | None) -> None:
+        if module is None:
+            return
+        resident_modules.append(module)
+        resident_names.append(name)
+
+    add_resident("bagel.time_embedder", getattr(self.bagel, "time_embedder", None))
+    add_resident("bagel.vae2llm", getattr(self.bagel, "vae2llm", None))
+    add_resident("bagel.llm2vae", getattr(self.bagel, "llm2vae", None))
+    add_resident("bagel.latent_pos_embed", getattr(self.bagel, "latent_pos_embed", None))
+    add_resident("bagel.vit_model", getattr(self.bagel, "vit_model", None))
+    add_resident("bagel.connector", getattr(self.bagel, "connector", None))
+    add_resident("bagel.vit_pos_embed", getattr(self.bagel, "vit_pos_embed", None))
 
     return PipelineModules(
         dits=[self.language_model.model],

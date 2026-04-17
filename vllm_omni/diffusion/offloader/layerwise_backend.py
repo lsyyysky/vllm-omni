@@ -306,8 +306,10 @@ class LayerWiseOffloadBackend(OffloadBackend):
 
         # Move resident modules to GPU
         for name, module in zip(modules.resident_names, modules.resident_modules):
-            logger.debug(f"Moving resident module {name} to device {self.device}")
-            module.to(self.device)
+            try:
+                module.to(self.device)
+            except Exception as exc:
+                logger.debug("Failed to move resident module %s to GPU: %s", name, exc)
 
         logger.info("Applying layer-wise offloading on %s", modules.dit_names)
 
