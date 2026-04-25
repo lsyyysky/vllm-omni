@@ -740,6 +740,12 @@ class Qwen2MoTDecoderLayer(nn.Module):
 class Qwen2MoTModel(Qwen2PreTrainedModel):
     _layerwise_offload_blocks_attrs = ["layers"]
 
+    @staticmethod
+    def _is_transformer_block(name: str, module) -> bool:
+        return "layers" in name and name.split(".")[-1].isdigit()
+
+    _hsdp_shard_conditions = [_is_transformer_block]
+
     def __init__(
         self,
         config,
@@ -777,10 +783,10 @@ class Qwen2MoTModel(Qwen2PreTrainedModel):
 
     def forward(
         self,
-        packed_query_sequence: torch.Tensor,
-        query_lens: torch.Tensor,
-        packed_query_position_ids: torch.Tensor,
-        packed_query_indexes: torch.Tensor,
+        packed_query_sequence: torch.Tensor | None = None,
+        query_lens: torch.Tensor | None = None,
+        packed_query_position_ids: torch.Tensor | None = None,
+        packed_query_indexes: torch.Tensor | None = None,
         past_key_values: NaiveCache | None = None,
         key_values_lens: torch.Tensor | None = None,
         packed_key_value_indexes: torch.Tensor | None = None,
@@ -789,7 +795,23 @@ class Qwen2MoTModel(Qwen2PreTrainedModel):
         mode="und",
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
+        packed_text_ids: torch.Tensor | None = None,
+        return_embeddings_only: bool = False,
     ) -> BaseNavitOutputWithPast:
+        if packed_query_sequence is None:
+            if packed_text_ids is None:
+                raise ValueError("Either packed_query_sequence or packed_text_ids must be provided.")
+            packed_query_sequence = self.embed_tokens(packed_text_ids)
+
+        if return_embeddings_only:
+            return BaseNavitOutputWithPast(
+                packed_query_sequence=packed_query_sequence,
+                past_key_values=past_key_values,
+            )
+
+        assert query_lens is not None
+        assert packed_query_position_ids is not None
+        assert packed_query_indexes is not None
         # create position embeddings to be shared across the decoder layers
         cos, sin = self.rotary_emb(packed_query_sequence, packed_query_position_ids.unsqueeze(0))
         cos = cos.squeeze(0)
@@ -881,10 +903,10 @@ class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
 
     def forward(
         self,
-        packed_query_sequence: torch.Tensor,
-        query_lens: torch.Tensor,
-        packed_query_position_ids: torch.Tensor,
-        packed_query_indexes: torch.Tensor,
+        packed_query_sequence: torch.Tensor | None = None,
+        query_lens: torch.Tensor | None = None,
+        packed_query_position_ids: torch.Tensor | None = None,
+        packed_query_indexes: torch.Tensor | None = None,
         past_key_values: NaiveCache | None = None,
         key_values_lens: torch.Tensor | None = None,
         packed_key_value_indexes: torch.Tensor | None = None,
@@ -893,6 +915,8 @@ class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
         mode="und",
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
+        packed_text_ids: torch.Tensor | None = None,
+        return_embeddings_only: bool = False,
     ) -> BaseNavitOutputWithPast:
         outputs = self.model(
             packed_query_sequence=packed_query_sequence,
@@ -907,6 +931,8 @@ class Qwen2MoTForCausalLM(Qwen2PreTrainedModel):
             mode=mode,
             packed_vae_token_indexes=packed_vae_token_indexes,
             packed_text_indexes=packed_text_indexes,
+            packed_text_ids=packed_text_ids,
+            return_embeddings_only=return_embeddings_only,
         )
 
         return outputs
@@ -1247,14 +1273,12 @@ class Bagel(nn.Module):
         packed_key_value_indexes: torch.LongTensor,
         key_values_lens: torch.IntTensor,
     ):
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
-
         extra_inputs = {}
         if self.use_moe:
             extra_inputs = {"mode": "und"}
 
         output = self.language_model.forward(
-            packed_query_sequence=packed_text_embedding,
+            packed_text_ids=packed_text_ids,
             query_lens=text_token_lens,
             packed_query_position_ids=packed_text_position_ids,
             packed_query_indexes=packed_text_indexes,
@@ -1360,10 +1384,6 @@ class Bagel(nn.Module):
         key_values_lens: torch.IntTensor,
         packed_key_value_indexes: torch.Tensor,
     ):
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
-        packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
-        packed_sequence[packed_text_indexes] = packed_text_embedding
-
         padded_latent = vae_model.encode(padded_images)
 
         p = self.latent_patch_size
@@ -1376,9 +1396,6 @@ class Bagel(nn.Module):
         packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
         packed_timestep_embeds = self.time_embedder(packed_timesteps)
         packed_latent = self.vae2llm(packed_latent) + packed_timestep_embeds + packed_pos_embed
-        if packed_latent.dtype != packed_sequence.dtype:
-            packed_latent = packed_latent.to(packed_sequence.dtype)
-        packed_sequence[packed_vae_token_indexes] = packed_latent
 
         extra_inputs = {}
         if self.use_moe:
@@ -1389,7 +1406,7 @@ class Bagel(nn.Module):
             }
 
         output = self.language_model.forward(
-            packed_query_sequence=packed_sequence,
+            packed_text_ids=packed_text_ids,
             query_lens=packed_seqlens,
             packed_query_position_ids=packed_position_ids,
             packed_query_indexes=packed_indexes,
@@ -1482,7 +1499,10 @@ class Bagel(nn.Module):
         packed_key_value_indexes: torch.LongTensor,
         key_values_lens: torch.IntTensor,
     ):
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        packed_text_embedding = self.language_model.forward(
+            packed_text_ids=packed_text_ids,
+            return_embeddings_only=True,
+        ).packed_query_sequence
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
@@ -1680,7 +1700,6 @@ class Bagel(nn.Module):
         curr_tokens = packed_start_tokens
         while step < max_length:
             generated_sequence.append(curr_tokens)
-            packed_text_embedding = self.language_model.model.embed_tokens(curr_tokens)
             query_lens = torch.ones_like(curr_tokens)
             packed_query_indexes = torch.cumsum(key_values_lens, dim=0) + torch.arange(
                 0,
@@ -1695,7 +1714,7 @@ class Bagel(nn.Module):
             packed_key_value_indexes = torch.cat(uppacked, dim=0)
 
             output = self.language_model(
-                packed_query_sequence=packed_text_embedding,
+                packed_text_ids=curr_tokens,
                 query_lens=query_lens,
                 packed_query_position_ids=packed_query_position_ids,
                 packed_query_indexes=packed_query_indexes,
@@ -2278,7 +2297,10 @@ class Bagel(nn.Module):
                 packed_position_ids,
             )
 
-            packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+            packed_text_embedding = self.language_model.forward(
+                packed_text_ids=packed_text_ids,
+                return_embeddings_only=True,
+            ).packed_query_sequence
             packed_sequence = packed_text_embedding.new_zeros((int(local_seqlens.sum()), self.hidden_size))
             packed_sequence[local_text_indexes] = packed_text_embedding
 
@@ -2333,7 +2355,10 @@ class Bagel(nn.Module):
             return self._gather_vae_for_sp(local_v_t)
 
         # Original non-SP path
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        packed_text_embedding = self.language_model.forward(
+            packed_text_ids=packed_text_ids,
+            return_embeddings_only=True,
+        ).packed_query_sequence
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
@@ -2388,7 +2413,10 @@ class Bagel(nn.Module):
         cfg_batched: dict | None = None,
     ):
         # Build query sequence (identical for all CFG branches)
-        packed_text_embedding = self.language_model.model.embed_tokens(packed_text_ids)
+        packed_text_embedding = self.language_model.forward(
+            packed_text_ids=packed_text_ids,
+            return_embeddings_only=True,
+        ).packed_query_sequence
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
