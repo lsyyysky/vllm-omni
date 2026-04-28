@@ -16,6 +16,7 @@ from pydantic import TypeAdapter
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
+from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 try:
@@ -87,6 +88,10 @@ from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.image_api_utils import validate_layered_layers
 from vllm_omni.entrypoints.openai.protocol import OmniChatCompletionStreamResponse
 from vllm_omni.entrypoints.openai.protocol.audio import AudioResponse, CreateAudio
+from vllm_omni.entrypoints.openai.stage_params import (
+    build_stage_sampling_params_list,
+    get_default_sampling_params_list,
+)
 from vllm_omni.entrypoints.openai.utils import (
     get_stage_type,
     get_supported_speakers_from_hf_config,
@@ -390,6 +395,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 else:
                     # Use standard OpenAI API parameters for comprehension stage
                     sampling_params_list = self._build_sampling_params_list_from_request(request)
+
+                # If this is a streaming (output) request, coerce cumulative outputs
+                # to delta to ensure emitted outputs are correctly drained. Otherwise
+                # convert cumulative to Final Only to ensure the output is correct.
+                sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
 
                 # Apply user-specified overrides to diffusion stage(s) for image generation
                 for idx, sp in enumerate(sampling_params_list):
@@ -1007,12 +1017,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             cur_channel = harmony_parser.current_channel
                             cur_recipient = harmony_parser.current_recipient
                         else:
-                            # output.text is cumulative, extract only the delta portion
-                            previous_text = previous_texts[i] if previous_texts else ""
-                            if output.text is not None:
-                                delta_text = output.text[len(previous_text) :]
-                            else:
-                                delta_text = ""
+                            delta_text = output.text or ""
 
                         if not delta_text and not output.token_ids and not previous_num_tokens[i]:
                             # Chunked prefill case, don't return empty chunks
@@ -2123,7 +2128,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     ) -> tuple[OmniTextPrompt, list[Any]]:
         """Build the shared multistage generation prompt and stage params."""
         stage_configs = getattr(engine, "stage_configs", None) or []
-        default_params_list = list(getattr(engine, "default_sampling_params_list", []) or [])
+        default_params_list = get_default_sampling_params_list(engine)
 
         height = gen_params.height
         width = gen_params.width
@@ -2173,20 +2178,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 comprehension_idx = idx
                 break
 
-        sampling_params_list: list[Any] = []
+        sampling_params_list = build_stage_sampling_params_list(
+            stage_configs,
+            default_params_list,
+            diffusion_params=gen_params,
+        )
         for idx, stage_cfg in enumerate(stage_configs):
             stage_type = get_stage_type(stage_cfg)
-            if idx < len(default_params_list):
-                default_stage_params = default_params_list[idx]
-                if hasattr(default_stage_params, "clone"):
-                    try:
-                        default_stage_params = default_stage_params.clone()
-                    except Exception:
-                        pass
-            elif stage_type == "diffusion":
-                default_stage_params = gen_params.clone()
-            else:
-                default_stage_params = SamplingParams()
+            default_stage_params = sampling_params_list[idx]
 
             if (
                 comprehension_idx is not None
@@ -2233,8 +2232,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                 default_stage_params.lora_scale = lora_scale
                     except Exception as e:  # pragma: no cover - safeguard
                         logger.warning("Failed to parse LoRA request: %s", e)
-
-            sampling_params_list.append(default_stage_params)
 
         return engine_prompt, sampling_params_list
 
@@ -2523,21 +2520,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             # Generate image
             diffusion_engine = cast(AsyncOmni, self._diffusion_engine)
             stage_configs = list(getattr(diffusion_engine, "stage_configs", []) or [])
-            default_params_list = list(getattr(diffusion_engine, "default_sampling_params_list", []) or [])
-
-            sampling_params_list: list[Any] = []
-            for idx, stage_cfg in enumerate(stage_configs):
-                if get_stage_type(stage_cfg) == "diffusion":
-                    sampling_params_list.append(gen_params)
-                    continue
-
-                default_stage_params = default_params_list[idx] if idx < len(default_params_list) else SamplingParams()
-                if hasattr(default_stage_params, "clone"):
-                    try:
-                        default_stage_params = default_stage_params.clone()
-                    except Exception as e:
-                        logger.warning("Failed to clone default params for stage %d: %s", idx, e)
-                sampling_params_list.append(default_stage_params)
+            sampling_params_list = build_stage_sampling_params_list(
+                stage_configs,
+                get_default_sampling_params_list(diffusion_engine),
+                diffusion_params=gen_params,
+                replace_diffusion_params=True,
+            )
 
             if not sampling_params_list:
                 sampling_params_list = [gen_params]
