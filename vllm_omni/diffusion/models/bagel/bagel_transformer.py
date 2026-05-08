@@ -824,9 +824,6 @@ class Qwen2MoTModel(Qwen2PreTrainedModel):
                 past_key_values=past_key_values,
             )
 
-        assert query_lens is not None
-        assert packed_query_position_ids is not None
-        assert packed_query_indexes is not None
         # create position embeddings to be shared across the decoder layers
         cos, sin = self.rotary_emb(packed_query_sequence, packed_query_position_ids.unsqueeze(0))
         cos = cos.squeeze(0)
