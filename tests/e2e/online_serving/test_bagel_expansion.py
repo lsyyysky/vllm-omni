@@ -31,7 +31,8 @@ PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
 def _get_diffusion_feature_cases(model: str):
     """Return L4 diffusion feature cases for Bagel.
     TeaCache, Cache-DiT, CFG-Parallel,
-    Ulysses-SP, Ring-Attention, Layerwise Offloading.
+    Ulysses-SP, Ring-Attention, Layerwise Offloading,
+    Hybrid Sharded Data Parallel, Tensor Parallelism, VAE Patch Parallelism.
     """
 
     return [
@@ -119,6 +120,21 @@ def _get_diffusion_feature_cases(model: str):
             id="parallel_hsdp_4",
             marks=PARALLEL_FEATURE_MARKS,
         ),
+        # Tensor Parallelism (TP) + VAE Patch Parallelism (size=2)
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                server_args=[
+                    "--tensor-parallel-size",
+                    "2",
+                    "--vae-patch-parallel-size",
+                    "2",
+                    "--vae-use-tiling",
+                ],
+            ),
+            id="tp_vae_patch_parallel_2",
+            marks=PARALLEL_FEATURE_MARKS,
+        ),
     ]
 
 
@@ -141,6 +157,7 @@ def test_bagel(
     - Ring-Attention (degree=2)
     - Layerwise Offloading
     - Hybrid Sharded Data Parallel (size=4)
+    - Tensor Parallelism (TP) + VAE Patch Parallelism (size=2)
 
     Validation is delegated to assert_diffusion_response in tests/helpers/assertions.py,
     which checks output dimensions and basic correctness.
