@@ -9,6 +9,8 @@ Coverage:
 - Ulysses-SP
 - Ring-Attention
 - Layerwise Offloading
+- Hybrid Sharded Data Parallel
+- Tensor Parallelism + VAE Patch Parallelism
 
 assert_diffusion_response validates successful generation and the expected
 512x512 resolution.
