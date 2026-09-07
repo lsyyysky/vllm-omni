@@ -36,12 +36,12 @@ PROMPT_CASES = (
     "red red red red red",
     "red red red red red red red red red red",
 )
-MIXED_BATCH_MISS_PROMPT = "A blue sphere floating above a forest at sunset"
 
 pytestmark = [
     pytest.mark.full_model,
     pytest.mark.slow,
     pytest.mark.diffusion,
+    pytest.mark.cache,
 ]
 
 
@@ -85,6 +85,21 @@ def _sampling_params(request: dict[str, Any]) -> list[SamplingParams]:
         ),
         SamplingParams(temperature=0.0, max_tokens=1, detokenize=False),
     ]
+
+
+def _cold_token_request(
+    request: dict[str, Any],
+    prompt_token_ids: list[int],
+) -> dict[str, Any]:
+    """Build a token request whose first cache block cannot be reused."""
+    cold_request = dict(request)
+    cold_request.pop("prompt")
+    cold_prompt_ids = list(prompt_token_ids)
+    assert len(cold_prompt_ids) >= BLOCK_SIZE
+    assert cold_prompt_ids[0] != cold_prompt_ids[1]
+    cold_prompt_ids[0], cold_prompt_ids[1] = cold_prompt_ids[1], cold_prompt_ids[0]
+    cold_request["prompt_token_ids"] = cold_prompt_ids
+    return cold_request
 
 
 def _install_ar2dit_capture(monkeypatch: pytest.MonkeyPatch) -> list[AR2DiTCapture]:
@@ -221,7 +236,8 @@ def test_live_engine_exercises_prefix_cache_miss_and_hit(captured_runner):
     assert [pair[1].answer_start_index for pair in pairs] == [28, 32, 37]
 
     warmed_request = _build_request(runner.omni, PROMPT_CASES[2])
-    miss_request = _build_request(runner.omni, MIXED_BATCH_MISS_PROMPT)
+    warmed_prompt_ids = pairs[2][1].token_ids[: pairs[2][1].answer_start_index]
+    miss_request = _cold_token_request(warmed_request, warmed_prompt_ids)
     capture_start = len(captures)
     runner.omni.generate(
         [warmed_request, miss_request],
@@ -231,12 +247,11 @@ def test_live_engine_exercises_prefix_cache_miss_and_hit(captured_runner):
     batch_captures = captures[capture_start:]
     assert len(batch_captures) == 2
 
-    warmed_prompt_ids = pairs[2][1].token_ids[: pairs[2][1].answer_start_index]
     warmed = next(
         capture for capture in batch_captures if capture.token_ids[: capture.answer_start_index] == warmed_prompt_ids
     )
     miss = next(capture for capture in batch_captures if capture is not warmed)
     assert warmed.cached_tokens == (len(warmed_prompt_ids) - 1) // BLOCK_SIZE * BLOCK_SIZE
     assert warmed.cache_creation_tokens == 0
-    assert miss.cached_tokens < warmed.cached_tokens
+    assert miss.cached_tokens == 0
     assert miss.cache_creation_tokens > 0
