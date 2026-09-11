@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Base worker class for vLLM-Omni with device-level GPU memory profiling."""
 
 from __future__ import annotations
@@ -86,6 +89,23 @@ class OmniGPUWorkerBase(GPUWorker):
             self.profiler.start()
         else:
             self.profiler.stop()
+
+    def get_omni_prefix_cache_memory_stats(self) -> dict[str, object]:
+        """Return CPU tensor memory owned by the model runner's prefix cache."""
+        prefix_cache = getattr(
+            self.model_runner,
+            "omni_prefix_cache",
+            None,
+        )
+        if prefix_cache is None:
+            return {
+                "enabled": False,
+                "static_cache_bytes": 0,
+                "pending_write_bytes": 0,
+                "total_cpu_bytes": 0,
+                "pinned_bytes": 0,
+            }
+        return prefix_cache.memory_stats()
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
@@ -215,7 +235,7 @@ class OmniGPUWorkerBase(GPUWorker):
         logger.info(f"[LLM Worker {self.rank}] Wake-up complete.")
         return True
 
-    def handle_sleep_task(self, task: OmniSleepTask) -> OmniACK:
+    def handle_sleep_task(self, task: OmniSleepTask) -> OmniACK | None:
         "Handle deterministic Sleep command from the main process"
         try:
             if isinstance(task, dict):
@@ -269,7 +289,7 @@ class OmniGPUWorkerBase(GPUWorker):
                     pass
             return OmniACK(task_id=task.task_id, status="ERROR", error_msg=str(e))
 
-    def handle_wake_task(self, task: OmniWakeTask) -> OmniACK:
+    def handle_wake_task(self, task: OmniWakeTask) -> OmniACK | None:
         "Handle deterministic Wakeup command from the main process"
         try:
             if isinstance(task, dict):
