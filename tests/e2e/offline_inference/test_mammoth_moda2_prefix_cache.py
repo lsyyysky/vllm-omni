@@ -158,6 +158,37 @@ def _mean_row_cosine(first: torch.Tensor, second: torch.Tensor) -> float:
     return float(similarity.mean())
 
 
+def _assert_conditioning_equivalent(
+    reference: AR2DiTCapture,
+    actual: AR2DiTCapture,
+    config: Mammothmoda2Config,
+) -> None:
+    """Compare one batch member with its standalone AR-to-DiT result."""
+    assert actual.answer_start_index == reference.answer_start_index
+    prompt_tokens = actual.answer_start_index
+    assert actual.token_ids[:prompt_tokens] == reference.token_ids[:prompt_tokens]
+    assert actual.hidden_states.shape == reference.hidden_states.shape
+
+    exact_prefix_tokens = min(reference.cached_tokens, actual.cached_tokens)
+    assert torch.equal(
+        actual.hidden_states[:exact_prefix_tokens],
+        reference.hidden_states[:exact_prefix_tokens],
+    )
+    if exact_prefix_tokens < prompt_tokens:
+        assert (
+            _mean_row_cosine(
+                actual.hidden_states[exact_prefix_tokens:prompt_tokens],
+                reference.hidden_states[exact_prefix_tokens:prompt_tokens],
+            )
+            >= 0.999
+        )
+
+    reference_text, reference_image = _split_conditions(reference, config)
+    actual_text, actual_image = _split_conditions(actual, config)
+    assert _mean_row_cosine(actual_text, reference_text) >= 0.999
+    assert _mean_row_cosine(actual_image, reference_image) >= MIN_IMAGE_CONDITION_COSINE
+
+
 def _assert_miss_hit_pair(
     miss: AR2DiTCapture,
     hit: AR2DiTCapture,
@@ -194,6 +225,20 @@ def _assert_miss_hit_pair(
     hit_text, hit_image = _split_conditions(hit, config)
     assert _mean_row_cosine(miss_text, hit_text) >= 0.999
     assert _mean_row_cosine(miss_image, hit_image) >= MIN_IMAGE_CONDITION_COSINE
+
+
+def _clear_prefix_cache(omni: Any) -> None:
+    pause_results = omni.engine.collective_rpc(
+        method="pause_scheduler",
+        kwargs={"mode": "wait", "clear_cache": True},
+        stage_ids=[0],
+    )
+    assert not any(isinstance(result, dict) and result.get("error") for result in pause_results)
+    resume_results = omni.engine.collective_rpc(
+        method="resume_scheduler",
+        stage_ids=[0],
+    )
+    assert not any(isinstance(result, dict) and result.get("error") for result in resume_results)
 
 
 @pytest.fixture
@@ -255,3 +300,19 @@ def test_live_engine_exercises_prefix_cache_miss_and_hit(captured_runner):
     assert warmed.cache_creation_tokens == 0
     assert miss.cached_tokens == 0
     assert miss.cache_creation_tokens > 0
+
+    # The batch miss populated its prefix. Clear it before collecting a
+    # standalone cold reference; captures above own cloned tensors.
+    _clear_prefix_cache(runner.omni)
+    reference_start = len(captures)
+    runner.omni.generate(
+        miss_request,
+        sampling_params_list=_sampling_params(miss_request),
+        use_tqdm=False,
+    )
+    assert len(captures) == reference_start + 1
+    miss_reference = captures[-1]
+    assert miss_reference.cached_tokens == 0
+
+    _assert_conditioning_equivalent(pairs[2][1], warmed, config)
+    _assert_conditioning_equivalent(miss_reference, miss, config)
