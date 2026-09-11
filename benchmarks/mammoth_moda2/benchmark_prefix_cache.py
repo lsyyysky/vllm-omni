@@ -178,6 +178,21 @@ def clear_prefix_cache(omni: Omni) -> None:
         raise RuntimeError(f"failed to resume scheduler: {resume_results}")
 
 
+def get_prefix_cache_memory_stats(omni: Omni) -> dict[str, Any]:
+    """Read tensor-accounted CPU prefix-cache memory from the AR worker."""
+    results = omni.engine.collective_rpc(
+        method="get_omni_prefix_cache_memory_stats",
+        stage_ids=[0],
+    )
+    worker_results = results[0] if len(results) == 1 and isinstance(results[0], list) else results
+    errors = [result for result in worker_results if isinstance(result, dict) and result.get("error")]
+    if errors:
+        raise RuntimeError(f"failed to read prefix-cache memory stats: {errors}")
+    if len(worker_results) != 1 or not isinstance(worker_results[0], dict):
+        raise RuntimeError(f"expected one AR worker prefix-cache memory result, got {worker_results}")
+    return worker_results[0]
+
+
 def validate_samples(
     scenario: str,
     samples: list[dict[str, Any]],
@@ -279,6 +294,7 @@ def main() -> None:
             args.seed,
         )
         warmup = run_once(omni, request, params, device_handle)
+        prefix_cache_cpu_memory = get_prefix_cache_memory_stats(omni)
 
         if args.profile_dir is not None:
             omni.start_profile(profile_prefix=f"mammoth_ar_{args.scenario}")
@@ -313,6 +329,7 @@ def main() -> None:
             "block_size": args.block_size,
             "iterations": args.iterations,
             "warmup": warmup,
+            "prefix_cache_cpu_memory": prefix_cache_cpu_memory,
             "samples": samples,
             "summary": summarize(samples),
             "environment": {
