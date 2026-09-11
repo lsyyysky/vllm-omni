@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import shlex
 import statistics
@@ -32,6 +33,7 @@ from vllm_omni.model_extras import build_text_to_image_prompt, get_model_class_n
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL = "bytedance-research/MammothModa2-Preview"
 DEFAULT_PROMPT = "A red cube on a white table"
+DEFAULT_BLOCK_SIZE = 16
 SCENARIO_CONFIG = {
     "a": "vllm_omni/deploy/mammoth_moda2_ar.yaml",
     "b1": "vllm_omni/deploy/mammoth_moda2_ar_prefix_cache.yaml",
@@ -51,8 +53,8 @@ def percentile(values: list[float], quantile: float) -> float:
 class MemoryMonitor:
     """Poll device-wide NVML memory while one isolated benchmark is running."""
 
-    def __init__(self, device_index: int) -> None:
-        self.handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+    def __init__(self, device_handle: Any) -> None:
+        self.handle = device_handle
         self.peak_mib = 0.0
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -72,6 +74,35 @@ class MemoryMonitor:
         self._thread.join()
         used = pynvml.nvmlDeviceGetMemoryInfo(self.handle).used / 1024**2
         self.peak_mib = max(self.peak_mib, float(used))
+
+
+def resolve_nvml_device(logical_index: int) -> tuple[Any, str]:
+    """Resolve a logical CUDA ordinal to its physical NVML device."""
+    if logical_index < 0:
+        raise ValueError("--device-index must be non-negative")
+
+    visible_devices = [
+        device.strip() for device in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if device.strip()
+    ]
+    if visible_devices:
+        if logical_index >= len(visible_devices):
+            raise ValueError(
+                f"--device-index {logical_index} is outside CUDA_VISIBLE_DEVICES={os.environ['CUDA_VISIBLE_DEVICES']!r}"
+            )
+        physical_device = visible_devices[logical_index]
+        try:
+            physical_index = int(physical_device)
+        except ValueError:
+            handle = pynvml.nvmlDeviceGetHandleByUUID(physical_device)
+        else:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(physical_index)
+    else:
+        device_count = pynvml.nvmlDeviceGetCount()
+        if logical_index >= device_count:
+            raise ValueError(f"--device-index {logical_index} is invalid for {device_count} physical GPUs")
+        handle = pynvml.nvmlDeviceGetHandleByIndex(logical_index)
+
+    return handle, str(pynvml.nvmlDeviceGetUUID(handle))
 
 
 def build_request(
@@ -104,9 +135,9 @@ def run_once(
     omni: Omni,
     request: dict[str, Any],
     params: SamplingParams,
-    device_index: int,
+    device_handle: Any,
 ) -> dict[str, Any]:
-    with MemoryMonitor(device_index) as memory:
+    with MemoryMonitor(device_handle) as memory:
         started = time.perf_counter()
         outputs = omni.generate(
             request,
@@ -121,6 +152,7 @@ def run_once(
     return {
         "latency_ms": elapsed * 1000,
         "ttft_ms": float(stage_metrics["vllm_ttft_ms"]),
+        "prompt_tokens": len(output.prompt_token_ids),
         "generated_tokens": len(token_ids),
         "tokens_per_second": len(token_ids) / elapsed,
         "cached_tokens": int(output.num_cached_tokens or 0),
@@ -149,13 +181,20 @@ def clear_prefix_cache(omni: Omni) -> None:
 def validate_samples(
     scenario: str,
     samples: list[dict[str, Any]],
+    block_size: int,
 ) -> None:
     if scenario == "a":
         valid = all(sample["cached_tokens"] == 0 and sample["cache_creation_tokens"] == 0 for sample in samples)
     elif scenario == "b1":
         valid = all(sample["cached_tokens"] == 0 and sample["cache_creation_tokens"] > 0 for sample in samples)
     else:
-        valid = all(sample["cached_tokens"] > 0 and sample["cache_creation_tokens"] == 0 for sample in samples)
+        valid = all(
+            sample["cached_tokens"] == (sample["prompt_tokens"] - 1) // block_size * block_size
+            and sample["cached_tokens"] > 0
+            and sample["cache_creation_tokens"]
+            == sample["prompt_tokens"] // block_size * block_size - sample["cached_tokens"]
+            for sample in samples
+        )
     if not valid:
         states = [(sample["cached_tokens"], sample["cache_creation_tokens"]) for sample in samples]
         raise RuntimeError(f"scenario {scenario} cache-state verification failed: {states}")
@@ -188,7 +227,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--iterations", type=int, default=10)
-    parser.add_argument("--device-index", type=int, default=0)
+    parser.add_argument("--block-size", type=int, default=DEFAULT_BLOCK_SIZE)
+    parser.add_argument(
+        "--device-index",
+        type=int,
+        default=0,
+        help="Logical CUDA device ordinal, resolved through CUDA_VISIBLE_DEVICES",
+    )
     parser.add_argument("--profile-dir", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
@@ -200,22 +245,21 @@ def main() -> None:
         raise ValueError("--iterations must be at least 1")
     if args.prompt_repeat < 1:
         raise ValueError("--prompt-repeat must be at least 1")
+    if args.block_size < 1:
+        raise ValueError("--block-size must be at least 1")
 
     pynvml.nvmlInit()
+    device_handle, device_uuid = resolve_nvml_device(args.device_index)
     deploy_config = REPO_ROOT / SCENARIO_CONFIG[args.scenario]
-    stage_overrides = None
+    stage_overrides = {"0": {"block_size": args.block_size}}
     if args.profile_dir is not None:
         args.profile_dir.mkdir(parents=True, exist_ok=True)
-        stage_overrides = {
-            "0": {
-                "profiler_config": {
-                    "profiler": "torch",
-                    "torch_profiler_dir": str(args.profile_dir),
-                    "torch_profiler_use_gzip": False,
-                    "torch_profiler_with_stack": False,
-                    "torch_profiler_record_shapes": True,
-                }
-            }
+        stage_overrides["0"]["profiler_config"] = {
+            "profiler": "torch",
+            "torch_profiler_dir": str(args.profile_dir),
+            "torch_profiler_use_gzip": False,
+            "torch_profiler_with_stack": False,
+            "torch_profiler_record_shapes": True,
         }
 
     omni = Omni(
@@ -234,7 +278,7 @@ def main() -> None:
             args.width,
             args.seed,
         )
-        warmup = run_once(omni, request, params, args.device_index)
+        warmup = run_once(omni, request, params, device_handle)
 
         if args.profile_dir is not None:
             omni.start_profile(profile_prefix=f"mammoth_ar_{args.scenario}")
@@ -248,14 +292,14 @@ def main() -> None:
                         omni,
                         request,
                         params,
-                        args.device_index,
+                        device_handle,
                     )
                 )
         finally:
             if args.profile_dir is not None:
                 omni.stop_profile()
 
-        validate_samples(args.scenario, samples)
+        validate_samples(args.scenario, samples, args.block_size)
         result = {
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "command": shlex.join(sys.argv),
@@ -266,6 +310,7 @@ def main() -> None:
             "prompt_repeat": args.prompt_repeat,
             "image_size": [args.height, args.width],
             "seed": args.seed,
+            "block_size": args.block_size,
             "iterations": args.iterations,
             "warmup": warmup,
             "samples": samples,
@@ -279,7 +324,9 @@ def main() -> None:
                 "python": platform.python_version(),
                 "torch": torch.__version__,
                 "vllm": vllm.__version__,
-                "gpu": pynvml.nvmlDeviceGetName(pynvml.nvmlDeviceGetHandleByIndex(args.device_index)),
+                "cuda_logical_device": args.device_index,
+                "gpu_uuid": device_uuid,
+                "gpu": pynvml.nvmlDeviceGetName(device_handle),
             },
             "profile_dir": (str(args.profile_dir) if args.profile_dir is not None else None),
         }
