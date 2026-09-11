@@ -9,8 +9,9 @@ This benchmark compares three cache states for the MammothModa2 AR stage:
   sample must be a verified cache hit.
 
 The harness records cache accounting, TTFT, end-to-end AR latency, generated
-token throughput, and device-wide peak GPU memory. It uses the AR-only deploy
-profiles and does not measure DiT execution.
+token throughput, device-wide peak GPU memory, and tensor-accounted CPU prefix
+cache memory. It uses the AR-only deploy profiles and does not measure DiT
+execution.
 
 ## Prerequisites
 
@@ -53,11 +54,21 @@ accounting does not satisfy these contracts:
 
 - A: `cached_tokens == 0` and `cache_creation_tokens == 0`.
 - B1: `cached_tokens == 0` and `cache_creation_tokens > 0`.
-- B2: `cached_tokens > 0` and `cache_creation_tokens == 0`.
+- B2: cached and newly created tokens match the prompt length and configured
+  block size. In particular, an exact block boundary legitimately recomputes
+  the final block needed to produce logits (for example, a 32-token prompt with
+  block size 16 reports 16 cached and 16 cache-creation tokens).
 
 For B1, the model and kernels are warmed first. The scheduler is then paused,
 its prefix cache is cleared, and it is resumed before each timed request. Cache
 reset time is excluded from request latency.
+
+The `prefix_cache_cpu_memory` result is read directly from the AR worker. It
+reports the allocated hidden-state and multimodal cache tensors, transient
+pending-write tensors, and the pinned-memory subset in bytes. Scenario A
+reports the cache as disabled; B1 and B2 allocate the same static CPU cache
+regardless of how many blocks are currently populated. This is distinct from
+`peak_gpu_memory_mib`, which is sampled device-wide through NVML.
 
 ## Diagnostic profiler
 
