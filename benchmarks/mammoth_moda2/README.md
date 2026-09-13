@@ -120,11 +120,6 @@ python .claude/skills/diffusion-perf-opt/scripts/trace_analyzer.py \
 - Warmup: one request
 - Measurements: 10 requests per scenario
 
-The raw per-request measurements and profiler summary are in
-`prefix_cache_results.ndjson` next to this document. It contains
-one metadata record, one record per A/B1/B2 scenario, and one profiler-summary
-record.
-
 ## Result summary
 
 For B1, all 10 requests reported zero cached tokens and 5,616 cache-creation
@@ -137,9 +132,121 @@ cache-creation tokens.
 - B2 versus B1: TTFT decreased by 84.5%, AR latency decreased by 6.0%,
   and throughput increased by 6.4%.
 - Peak device memory was 40,408.8 MiB for A and 40,410.8 MiB for B1/B2.
+- The B1/B2 CPU hidden-state cache allocation was 1,062,813,696 bytes
+  (1,013.58 MiB), all pinned; pending-write and multimodal-cache bytes were
+  zero after warmup.
 
 The shorter 587-token profiler workload reduced scheduled prefill from 587
 tokens to 11. Prefill CUDA time decreased from 42.11 ms to 31.09 ms, while
 total GEMM and GPU busy time remained nearly unchanged because autoregressive
 decode was unaffected. D2H transfer volume increased by about 1.94 MiB and
 transfer time increased by about 1.4 ms.
+
+## Full AR to DiT attribution
+
+`benchmark_ar2dit_e2e.py` uses the two-stage deploy configs and records
+unprofiled client E2E, AR TTFT/decode/total, AR-to-DiT reconstruction, handoff
+serialization/submission, DiT total, and unattributed orchestration time. It
+also reports the exact float32 hidden-state tensor payload size; transport RX
+fields remain zero for the current same-host in-process handoff.
+
+```bash
+python benchmarks/mammoth_moda2/benchmark_ar2dit_e2e.py \
+  --scenario a \
+  --model /root/models/MammothModa2-Preview \
+  --prompt-repeat 800 \
+  --iterations 10 \
+  --output /tmp/mammoth_full_a.json
+
+python benchmarks/mammoth_moda2/benchmark_ar2dit_e2e.py \
+  --scenario b2 \
+  --model /root/models/MammothModa2-Preview \
+  --prompt-repeat 800 \
+  --iterations 10 \
+  --output /tmp/mammoth_full_b2.json
+```
+
+Collect stage-isolated diagnostic traces in separate runs. Profiler timings
+must not be mixed with the authoritative unprofiled measurements:
+
+```bash
+python benchmarks/mammoth_moda2/benchmark_ar2dit_e2e.py \
+  --scenario b2 --model /root/models/MammothModa2-Preview \
+  --prompt-repeat 800 --iterations 1 --profile-stage 0 \
+  --profile-dir /tmp/mammoth_full_stage0 \
+  --output /tmp/mammoth_full_stage0.json
+
+python benchmarks/mammoth_moda2/benchmark_ar2dit_e2e.py \
+  --scenario b2 --model /root/models/MammothModa2-Preview \
+  --prompt-repeat 800 --iterations 1 --profile-stage 1 \
+  --profile-dir /tmp/mammoth_full_stage1 \
+  --output /tmp/mammoth_full_stage1.json
+```
+
+Analyze each exported `trace_rank0.json` with `trace_analyzer.py` as shown
+above, then gzip and checksum the raw artifacts before upload:
+
+```bash
+python .claude/skills/diffusion-perf-opt/scripts/trace_analyzer.py \
+  /tmp/mammoth_full_stage0/*/trace_rank0.json \
+  --min-gap-ms 1 --topn 20
+
+python .claude/skills/diffusion-perf-opt/scripts/trace_analyzer.py \
+  /tmp/mammoth_full_stage1/*/trace_rank0.json \
+  --min-gap-ms 1 --topn 20
+
+gzip -9 /tmp/mammoth_full_stage0/*/trace_rank0.json
+gzip -9 /tmp/mammoth_full_stage1/*/trace_rank0.json
+
+sha256sum /tmp/mammoth_full_stage0/*/trace_rank0.json.gz
+sha256sum /tmp/mammoth_full_stage1/*/trace_rank0.json.gz
+```
+
+The generated benchmark JSON files contain the raw per-request samples and
+environment metadata. Stage 0 contains AR prefill/decode and the latent D2H
+copy; stage 1 contains conditioning H2D, DiT denoising, and VAE decode. The CPU-side
+`full_hidden_states.float().contiguous()` reconstruction is measured by
+`ar2dit_reconstruction_ms`, outside the GPU trace windows.
+
+For the same 5,627-token, 50-step workload used above, the 10-request
+unprofiled attribution was:
+
+- A: E2E 20,948.66 ± 91.07 ms; AR 5,965.55 ± 81.73 ms; handoff
+  108.69 ± 4.15 ms; DiT 14,859.15 ± 15.21 ms.
+- B2: E2E 20,804.66 ± 40.45 ms; AR 5,754.00 ± 37.61 ms; handoff
+  99.29 ± 17.71 ms; DiT 14,934.20 ± 19.76 ms.
+- The float32 AR-to-DiT hidden-state payload was 84,568,064 bytes.
+
+The stage-isolated traces are diagnostic. Stage 0 showed 3.137 s GPU busy in
+a 9.066 s span; pinned D2H copies totaled 3.202 ms. Stage 1 showed 13.894 s
+GPU busy in a 16.389 s span; pageable H2D copies totaled 8.606 ms. Attention
+and GEMM dominate the DiT path, while gaps of at least 1 ms totaled 0.126 s;
+bulk conditioning transfer is negligible.
+
+## Image-quality comparison
+
+`benchmark_image_quality.py` compares cache-disabled A with warm-hit B2 for
+three prompts and three seeds. It requires request-local DiT seed propagation;
+the reported run used the independent `fix/mammothmoda2-dit-seed` branch on
+top of this branch. Metric calculation also requires `numpy`, `scikit-image`,
+and `transformers`. Run each generation scenario in a separate process, then
+compute pixel and CLIP metrics:
+
+```bash
+python benchmarks/mammoth_moda2/benchmark_image_quality.py generate \
+  --scenario a --model /root/models/MammothModa2-Preview \
+  --output-dir /tmp/mammoth_quality
+
+python benchmarks/mammoth_moda2/benchmark_image_quality.py generate \
+  --scenario b2 --model /root/models/MammothModa2-Preview \
+  --output-dir /tmp/mammoth_quality
+
+python benchmarks/mammoth_moda2/benchmark_image_quality.py compare \
+  --output-dir /tmp/mammoth_quality \
+  --output /tmp/mammoth_quality_metrics.json
+```
+
+Across the nine matched pairs, mean image-image CLIP cosine similarity was
+0.9800 ± 0.0152, SSIM was 0.9121 ± 0.0960, and PSNR was
+28.28 ± 7.08 dB. Mean text-image CLIP cosine was 0.2214 for A and 0.2242
+for B2 (B2 minus A: +0.0028).
