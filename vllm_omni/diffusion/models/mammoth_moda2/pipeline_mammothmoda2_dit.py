@@ -4,16 +4,20 @@ from collections.abc import Iterable
 from typing import Any, ClassVar
 
 import torch
+from diffusers.image_processor import VaeImageProcessor
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from diffusers.utils.torch_utils import randn_tensor
+from PIL import Image
 from torch import nn
 from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
-from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
+from vllm.transformers_utils.config import get_config
 
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
-from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
 
 from .mammothmoda2_dit_model import SimpleQFormerImageRefiner, Transformer2DModel
@@ -23,7 +27,20 @@ from .schedulers import FlowMatchEulerDiscreteScheduler
 logger = init_logger(__name__)
 
 
-class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
+def get_mammoth_moda2_post_process_func(od_config: OmniDiffusionConfig):
+    del od_config
+
+    image_processor = VaeImageProcessor(vae_scale_factor=8)
+
+    def post_process_func(
+        images: torch.Tensor,
+    ) -> list[Image.Image]:
+        return image_processor.postprocess(images, output_type="pil")
+
+    return post_process_func
+
+
+class MammothModa2DiTPipeline(nn.Module, CFGParallelMixin, SupportsComponentDiscovery):
     """
     MammothModa2 DiT + VAE generation stage (non-autoregressive).
 
@@ -46,11 +63,18 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         }
     )
 
-    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
         del prefix
 
-        hf_config = vllm_config.model_config.hf_config
+        self.od_config = od_config
+        self.parallel_config = od_config.parallel_config
+
+        hf_config = get_config(
+            od_config.model,
+            trust_remote_code=od_config.trust_remote_code,
+            revision=od_config.revision,
+        )
         if not isinstance(hf_config, Mammothmoda2Config):
             raise TypeError(f"Expected Mammothmoda2Config, got {type(hf_config)}")
 
@@ -195,30 +219,40 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         image_cond = full_hidden_states[image_mask].to(dtype=torch.float32).contiguous()
         return text_cond, image_cond
 
+    def predict_noise(self, **kwargs: Any) -> torch.Tensor:
+        """Run one MammothModa2 CFG branch."""
+        return self.gen_transformer(**kwargs)
+
     @torch.inference_mode()
-    def forward(
-        self,
-        *,
-        inputs_embeds: torch.Tensor | None = None,
-        **kwargs: Any,  # noqa: ARG002
-    ) -> OmniOutput:
-        runtime_addi = kwargs.get("runtime_additional_information", None)
-        info = runtime_addi[0]
+    def forward(self, req: DiffusionRequestBatch) -> DiffusionOutput:
+        if req.num_reqs != 1:
+            raise ValueError("MammothModa2 only supports one request at a time")
+        first_prompt = req.prompts[0]
+        if not isinstance(first_prompt, dict):
+            raise TypeError("MammothModa2 requires a dictionary prompt")
+
+        info = first_prompt.get("extra", {})
+        sampling_params = req.sampling_params
+        extra_args = sampling_params.extra_args or {}
 
         # Sampling knobs are declared in vllm_omni/model_extras/mammothmodal2_preview.py
-        # and routed via extra_body -> sampling_params.extra_args (surfaced here as
-        # ``sampling_extra_args``). Fall back to runtime_additional_information for the
-        # legacy bespoke-example path during the transition.
-        extra_args_list = kwargs.get("sampling_extra_args") or []
-        extra_args = extra_args_list[0] if extra_args_list else {}
-        text_guidance_scale = float(extra_args.get("text_guidance_scale", info["text_guidance_scale"][0]))
-        cfg_range_val = extra_args.get("cfg_range", info["cfg_range"])
+        # and routed via extra_body -> sampling_params.extra_args. Standard
+        # diffusion knobs use their dedicated sampling-parameter fields.
+        text_guidance_scale = float(extra_args.get("text_guidance_scale", 9.0))
+        cfg_range_val = extra_args.get("cfg_range", [0.0, 1.0])
         cfg_range = float(cfg_range_val[0]), float(cfg_range_val[1])
-        num_inference_steps = int(extra_args.get("num_inference_steps", info["num_inference_steps"][0]))
+        num_inference_steps = int(
+            sampling_params.num_inference_steps
+            or extra_args.get("num_inference_steps")
+            or 50
+        )
 
         negative_cond = info.get("negative_prompt_embeds")
         negative_attention_mask = info.get("negative_prompt_attention_mask")
-        image_hw = info["image_height"][0], info["image_width"][0]
+        image_hw = (
+            first_prompt.get("height") or sampling_params.height or 1024,
+            first_prompt.get("width") or sampling_params.width or 1024,
+        )
 
         # Split the AR hidden states into text / image conditions. The token ids that
         # drive the split are sourced from the model config (see _split_ar_conditions),
@@ -231,7 +265,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             text_cond, image_cond = self._split_ar_conditions(
                 full_hidden_states=info["full_hidden_states"],
                 full_token_ids=info["full_token_ids"],
-                answer_start_index=int(info["answer_start_index"][0]),
+                answer_start_index=int(info["answer_start_index"]),
             )
 
         # Move to model device/dtype.
@@ -251,7 +285,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         text_cond = _ensure_2d(text_cond, "text_prompt_embeds")
         image_cond = _ensure_2d(image_cond, "image_prompt_embeds")
         if image_cond.shape[0] == 0:
-            answer_token_ids = info.get("full_token_ids", [])[int(info.get("answer_start_index", [0])[0]) :]
+            answer_token_ids = info.get("full_token_ids", [])[int(info.get("answer_start_index", 0)) :]
             raise ValueError(
                 "MammothModa2 AR stage produced no visual-token hidden states; "
                 "the DiT stage requires at least one generated visual token. "
@@ -360,27 +394,37 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
         total_steps = max(1, len(scheduler.timesteps))
         for i, t in enumerate(scheduler.timesteps):
             timestep = t.expand(latents.shape[0]).to(latents.dtype)
-            model_pred = self.gen_transformer(
-                hidden_states=latents,
-                timestep=timestep,
-                text_hidden_states=prompt_embeds,
-                text_attention_mask=prompt_attention_mask,
-                ref_image_hidden_states=None,
-                ar_image_hidden_states=ar_image_embeds,
-                ar_image_attention_mask=ar_image_attention_mask,
-                freqs_cis=self.gen_freqs_cis,
-            )
+            positive_kwargs = {
+                "hidden_states": latents,
+                "timestep": timestep,
+                "text_hidden_states": prompt_embeds,
+                "text_attention_mask": prompt_attention_mask,
+                "ref_image_hidden_states": None,
+                "ar_image_hidden_states": ar_image_embeds,
+                "ar_image_attention_mask": ar_image_attention_mask,
+                "freqs_cis": self.gen_freqs_cis,
+            }
             guidance_scale = text_guidance_scale if cfg_range[0] <= i / total_steps <= cfg_range[1] else 1.0
-            if guidance_scale > 1.0 and negative_prompt_embeds is not None:
-                model_pred_uncond = self.gen_transformer(
-                    hidden_states=latents,
-                    timestep=timestep,
-                    text_hidden_states=negative_prompt_embeds,
-                    text_attention_mask=negative_prompt_attention_mask,
-                    ref_image_hidden_states=None,
-                    freqs_cis=self.gen_freqs_cis,
-                )
-                model_pred = model_pred_uncond + guidance_scale * (model_pred - model_pred_uncond)
+            do_true_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
+
+            negative_kwargs = None
+            if do_true_cfg:
+                negative_kwargs = {
+                    "hidden_states": latents,
+                    "timestep": timestep,
+                    "text_hidden_states": negative_prompt_embeds,
+                    "text_attention_mask": negative_prompt_attention_mask,
+                    "ref_image_hidden_states": None,
+                    "freqs_cis": self.gen_freqs_cis,
+                }
+
+            model_pred = self.predict_noise_maybe_with_cfg(
+                do_true_cfg=do_true_cfg,
+                true_cfg_scale=guidance_scale,
+                positive_kwargs=positive_kwargs,
+                negative_kwargs=negative_kwargs,
+                cfg_normalize=False,
+            )
             latents = scheduler.step(model_pred, t, latents, return_dict=False)[0]
             latents = latents.to(dtype=prompt_embeds.dtype)
 
@@ -391,11 +435,7 @@ class MammothModa2DiTPipeline(nn.Module, SupportsComponentDiscovery):
             latents = latents + self.gen_vae.config.shift_factor
         image = self.gen_vae.decode(latents, return_dict=False)[0]
 
-        return OmniOutput(
-            text_hidden_states=inputs_embeds,  # placeholder, not used by runner
-            multimodal_outputs=image,
-            intermediate_tensors=None,
-        )
+        return DiffusionOutput(output=image)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:  # noqa: ARG002
         return None

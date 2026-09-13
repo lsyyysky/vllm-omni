@@ -1382,6 +1382,15 @@ stages:
         assert deploy.stages[0].compilation_config == {"pass_config": {"fuse_allreduce_rms": False}}
         assert "compilation_config" not in deploy.stages[0].engine_extras
 
+    def test_mammoth_moda2_uses_shared_diffusion_runtime(self):
+        pipeline = resolve_pipeline_config("mammoth_moda2")
+        assert isinstance(pipeline, PipelineConfig)
+        dit_stage = pipeline.stages[1]
+
+        assert dit_stage.execution_type == StageExecutionType.DIFFUSION
+        assert dit_stage.model_arch == "MammothModa2DiTPipeline"
+        assert dit_stage.custom_process_input_func.endswith(".mammoth_moda2.ar2diffusion")
+
     def test_load_voxcpm2_deploy_config_preserves_engine_extras(self):
         deploy_path = get_deploy_config_path("voxcpm2.yaml")
         raw_stage = get_deploy_config_stage("voxcpm2.yaml", 0)

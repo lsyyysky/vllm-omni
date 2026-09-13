@@ -46,6 +46,11 @@ _DIFFUSION_MODELS = {
         "pipeline_glm_image",
         "GlmImagePipeline",
     ),
+    "MammothModa2DiTPipeline": (
+        "mammoth_moda2",
+        "pipeline_mammothmoda2_dit",
+        "MammothModa2DiTPipeline",
+    ),
     "ZImagePipeline": (
         "z_image",
         "pipeline_z_image",
@@ -361,6 +366,7 @@ DiffusionModelRegistry = _ModelRegistry(
 
 _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
+    "MammothModa2DiTPipeline",
     "NextStep11Pipeline",
     # π0 is a flow-matching VLA with a self-contained sample_actions loop and no
     # DiT-style ``.transformer`` block list, so cache_dit / tea_cache cannot apply
@@ -541,6 +547,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "QwenImageEditPipeline": "get_qwen_image_edit_post_process_func",
     "QwenImageEditPlusPipeline": "get_qwen_image_edit_plus_post_process_func",
     "GlmImagePipeline": "get_glm_image_post_process_func",
+    "MammothModa2DiTPipeline": "get_mammoth_moda2_post_process_func",
     "ZImagePipeline": "get_post_process_func",
     "OvisImagePipeline": "get_ovis_image_post_process_func",
     "BooguImagePipeline": "get_boogu_image_post_process_func",

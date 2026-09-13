@@ -21,6 +21,7 @@ MAMMOTH_MODA2_PIPELINE = PipelineConfig(
     default_deploy_config_name="mammoth_moda2.yaml",
     model_arch="MammothModa2ForConditionalGeneration",
     hf_architectures=("Mammothmoda2Model", "MammothModa2ForConditionalGeneration"),
+    diffusers_class_name="MammothModa2DiTPipeline",
     stages=(
         StagePipelineConfig(
             stage_id=0,
@@ -35,14 +36,12 @@ MAMMOTH_MODA2_PIPELINE = PipelineConfig(
         StagePipelineConfig(
             stage_id=1,
             model_stage="dit",
-            execution_type=StageExecutionType.LLM_GENERATION,
+            execution_type=StageExecutionType.DIFFUSION,
             input_sources=(0,),
             final_output=True,
             final_output_type="image",
-            owns_tokenizer=False,
-            requires_multimodal_data=False,
-            engine_output_type="image",
-            custom_process_input_func=f"{_PROC}.ar2dit",
+            model_arch="MammothModa2DiTPipeline",
+            custom_process_input_func=f"{_PROC}.ar2diffusion",
         ),
     ),
 )

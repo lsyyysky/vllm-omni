@@ -67,9 +67,8 @@ MAMMOTHMODA2_PREVIEW_EXTRA_BODY_PARAMS = frozenset(
     {
         "text_guidance_scale",
         "cfg_range",
-        # MammothModa2's DiT stage consumes inputs via the kwargs interface rather
-        # than OmniDiffusionRequest, so the standard --num-inference-steps flag does
-        # not reach it; it is routed through extra_body like the CFG knobs.
+        # Retained for clients that supplied this through extra_body before the
+        # DiT stage moved to the shared diffusion request contract.
         "num_inference_steps",
     }
 )
