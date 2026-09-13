@@ -282,9 +282,10 @@ class OmniTensorPrefixCache:
             if hidden_states_gpu is not None:
                 hidden_cpu = hidden_states_gpu[:num_tokens_unpadded].to("cpu", non_blocking=True)
             mm_cpu: dict[str, torch.Tensor] = {}
-            assert multimodal_outputs_gpu is not None
-            for k in cacheable_mm_keys:
-                mm_cpu[k] = multimodal_outputs_gpu[k][:num_tokens_unpadded].to("cpu", non_blocking=True)
+            if cacheable_mm_keys:
+                assert multimodal_outputs_gpu is not None
+                for k in cacheable_mm_keys:
+                    mm_cpu[k] = multimodal_outputs_gpu[k][:num_tokens_unpadded].to("cpu", non_blocking=True)
 
             event = torch.cuda.Event()
             event.record()
