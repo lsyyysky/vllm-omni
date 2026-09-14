@@ -109,7 +109,7 @@ config = build_quant_config({
 
 | Component | Default quantized? | Notes |
 | ----------- | -------------------- | ------- |
-| Diffusion transformer | Yes | Primary target for FP8, Int8, BitsAndBytes, ModelOpt, MXFP8, MXFP4, AutoRound, and msModelSlim |
+| Diffusion transformer | Yes | Primary target for FP8, Int8, BitsAndBytes, ModelOpt, MXFP8, MXFP4, AutoRound, TorchAO, and msModelSlim |
 | Text encoder | No | Keep BF16 unless a method-specific guide documents support |
 | VAE | No | Keep BF16; storage-only paths are method-specific |
 | Scheduler/tokenizer | No | Loaded from the base model repository |
