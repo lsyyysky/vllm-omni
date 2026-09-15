@@ -12,7 +12,6 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
-from skimage.metrics import structural_similarity
 from transformers import CLIPModel, CLIPProcessor
 from vllm import SamplingParams
 
@@ -129,6 +128,8 @@ def _pil_image(image: np.ndarray) -> Image.Image:
 
 
 def compare(args: argparse.Namespace) -> None:
+    from skimage.metrics import structural_similarity
+
     model = CLIPModel.from_pretrained(CLIP_MODEL).eval()
     processor = CLIPProcessor.from_pretrained(CLIP_MODEL)
     rows = []

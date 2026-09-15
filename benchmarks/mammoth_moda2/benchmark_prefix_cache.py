@@ -266,7 +266,12 @@ def main() -> None:
     pynvml.nvmlInit()
     device_handle, device_uuid = resolve_nvml_device(args.device_index)
     deploy_config = REPO_ROOT / SCENARIO_CONFIG[args.scenario]
-    stage_overrides = {"0": {"block_size": args.block_size}}
+    stage_overrides = {
+        "0": {
+            "block_size": args.block_size,
+            "devices": str(args.device_index),
+        }
+    }
     if args.profile_dir is not None:
         args.profile_dir.mkdir(parents=True, exist_ok=True)
         stage_overrides["0"]["profiler_config"] = {
