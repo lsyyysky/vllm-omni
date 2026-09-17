@@ -37,6 +37,7 @@ pytestmark = [
 ]
 
 _NUM_LAYERS = 2
+_MAX_ROUTE_RELATIVE_L2_ERROR = 0.2
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -301,6 +302,13 @@ def test_bagel_online_fp8_mot_mixed_route_matches_bf16_reference():
                 dim=-1,
             )
             assert route_similarity.min().item() > 0.98
+            relative_l2_error = torch.linalg.vector_norm(
+                actual.float() - expected.float(),
+                dim=-1,
+            ) / torch.linalg.vector_norm(expected.float(), dim=-1).clamp_min(
+                torch.finfo(torch.float32).eps
+            )
+            assert relative_l2_error.max().item() < _MAX_ROUTE_RELATIVE_L2_ERROR
 
 
 def test_bagel_checkpoint_remaps_text_and_generation_experts():

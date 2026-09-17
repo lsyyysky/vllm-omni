@@ -357,7 +357,6 @@ Stage-0 Thinker stays BF16. Prefer the diffusion-scoped flag:
 python examples/offline_inference/text_to_image/text_to_image.py \
   --model ByteDance-Seed/BAGEL-7B-MoT \
   --deploy-config vllm_omni/deploy/bagel.yaml \
-  --quantization fp8 \
   --prompt "A beautiful sunset over mountains" \
   --height 512 \
   --width 512 \
