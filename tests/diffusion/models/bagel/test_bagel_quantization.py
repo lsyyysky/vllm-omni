@@ -305,9 +305,7 @@ def test_bagel_online_fp8_mot_mixed_route_matches_bf16_reference():
             relative_l2_error = torch.linalg.vector_norm(
                 actual.float() - expected.float(),
                 dim=-1,
-            ) / torch.linalg.vector_norm(expected.float(), dim=-1).clamp_min(
-                torch.finfo(torch.float32).eps
-            )
+            ) / torch.linalg.vector_norm(expected.float(), dim=-1).clamp_min(torch.finfo(torch.float32).eps)
             assert relative_l2_error.max().item() < _MAX_ROUTE_RELATIVE_L2_ERROR
 
 
