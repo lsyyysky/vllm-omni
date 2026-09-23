@@ -157,7 +157,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--enable-cache-dit-summary",
         action="store_true",
-        help="Enable cache-dit summary logging after diffusion forward passes.",
+        default=None,
+        help=(
+            "Enable cache-dit summary logging after diffusion forward passes. "
+            "Default: unset (defer to the deploy YAML's enable_cache_dit_summary)."
+        ),
     )
     parser.add_argument(
         "--ulysses-degree",
@@ -571,7 +575,6 @@ def main():
         "vae_patch_parallel_size": args.vae_patch_parallel_size,
         "enable_expert_parallel": args.enable_expert_parallel,
         "enable_cpu_offload": args.enable_cpu_offload,
-        "mode": "text-to-image",
         "log_stats": args.log_stats,
         "enable_diffusion_pipeline_profiler": args.enable_diffusion_pipeline_profiler,
         "profiler_config": args.profiler_config,
@@ -744,7 +747,10 @@ def main():
     # stop-token-ids declaratively from the plain prompt + extra_body, so this
     # example stays model-agnostic. Models without one are untouched.
     ar_input_builder = get_ar_input_builder(model_class_name)
-    if ar_input_builder is not None:
+    # A model can also be deployed with only its diffusion stage. Keep those
+    # requests on the string-prompt path, as in the single-stage images API.
+    has_ar_stage = any(not isinstance(params, OmniDiffusionSamplingParams) for params in sampling_params_list)
+    if ar_input_builder is not None and has_ar_stage:
         _apply_ar_stage_inputs(
             ar_input_builder,
             model=args.model,
