@@ -17,6 +17,7 @@ from vllm.sampling_params import SamplingParams
 from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniRunner
 from tests.helpers.stage_config import get_deploy_config_path
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.stage_input_processors import mammoth_moda2 as stage_processor
 from vllm_omni.model_extras import build_text_to_image_prompt, get_model_class_name
 from vllm_omni.transformers_utils.configs.mammoth_moda2 import Mammothmoda2Config
@@ -72,7 +73,9 @@ def _build_request(omni: Any, prompt: str) -> dict[str, Any]:
     return request
 
 
-def _sampling_params(request: dict[str, Any]) -> list[SamplingParams]:
+def _sampling_params(
+    request: dict[str, Any],
+) -> list[SamplingParams | OmniDiffusionSamplingParams]:
     info = request["additional_information"]
     ar_width = int(info["ar_width"][0])
     ar_height = int(info["ar_height"][0])
@@ -83,7 +86,13 @@ def _sampling_params(request: dict[str, Any]) -> list[SamplingParams]:
             max_tokens=ar_height * (ar_width + 1) + 1,
             detokenize=False,
         ),
-        SamplingParams(temperature=0.0, max_tokens=1, detokenize=False),
+        OmniDiffusionSamplingParams(
+            height=IMAGE_SIZE,
+            width=IMAGE_SIZE,
+            guidance_scale=1.0,
+            num_inference_steps=2,
+            extra_args={"cfg_range": [0.0, 1.0]},
+        ),
     ]
 
 
@@ -102,27 +111,27 @@ def _cold_token_request(
     return cold_request
 
 
-def _install_ar2dit_capture(monkeypatch: pytest.MonkeyPatch) -> list[AR2DiTCapture]:
+def _install_ar2diffusion_capture(monkeypatch: pytest.MonkeyPatch) -> list[AR2DiTCapture]:
     """Observe the real AR-to-DiT conversion without changing its result."""
     captures: list[AR2DiTCapture] = []
-    original_ar2dit = stage_processor.ar2dit
+    original_ar2diffusion = stage_processor.ar2diffusion
 
-    def capture_ar2dit(source_outputs, prompts=None, _requires_multimodal_data=False):
-        dit_inputs = original_ar2dit(source_outputs, prompts, _requires_multimodal_data)
-        for ar_output, dit_input in zip(source_outputs, dit_inputs, strict=True):
-            info = dit_input["additional_information"]
-            captures.append(
-                AR2DiTCapture(
-                    cached_tokens=int(ar_output.num_cached_tokens or 0),
-                    cache_creation_tokens=int(ar_output.num_cache_creation_tokens or 0),
-                    token_ids=list(info["full_token_ids"]),
-                    hidden_states=info["full_hidden_states"].detach().cpu().clone(),
-                    answer_start_index=int(info["answer_start_index"][0]),
-                )
+    def capture_ar2diffusion(source_outputs, prompts=None, requires_multimodal_data=False):
+        dit_input = original_ar2diffusion(source_outputs, prompts, requires_multimodal_data)
+        ar_output = source_outputs[0]
+        info = dit_input["additional_information"]
+        captures.append(
+            AR2DiTCapture(
+                cached_tokens=int(ar_output.num_cached_tokens or 0),
+                cache_creation_tokens=int(ar_output.num_cache_creation_tokens or 0),
+                token_ids=list(info["full_token_ids"]),
+                hidden_states=info["full_hidden_states"].detach().cpu().clone(),
+                answer_start_index=int(info["answer_start_index"]),
             )
-        return dit_inputs
+        )
+        return dit_input
 
-    monkeypatch.setattr(stage_processor, "ar2dit", capture_ar2dit)
+    monkeypatch.setattr(stage_processor, "ar2diffusion", capture_ar2diffusion)
     return captures
 
 
@@ -245,7 +254,7 @@ def _clear_prefix_cache(omni: Any) -> None:
 def captured_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> Generator[tuple[OmniRunner, list[AR2DiTCapture]], None, None]:
-    captures = _install_ar2dit_capture(monkeypatch)
+    captures = _install_ar2diffusion_capture(monkeypatch)
     with OmniRunner(MODEL, deploy_config=DEPLOY_CONFIG) as runner:
         yield runner, captures
 
