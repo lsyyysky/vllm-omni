@@ -9,8 +9,11 @@ This benchmark compares three cache states for the MammothModa2 AR stage:
   sample must be a verified cache hit.
 
 The harness records cache accounting, TTFT, end-to-end AR latency, generated
-token throughput, and device-wide peak GPU memory. It uses the AR-only deploy
-profiles and does not measure DiT execution.
+token throughput, and device-wide peak GPU memory. It uses the AR-only base
+profile and enables prefix caching explicitly through a stage override for B1
+and B2; it does not measure DiT execution. This benchmark-only override still
+includes hidden-state D2H caching and is not a recommended AR-only serving
+profile.
 
 ## Prerequisites
 

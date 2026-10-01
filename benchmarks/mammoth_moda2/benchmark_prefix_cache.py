@@ -34,11 +34,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL = "bytedance-research/MammothModa2-Preview"
 DEFAULT_PROMPT = "A red cube on a white table"
 DEFAULT_BLOCK_SIZE = 16
-SCENARIO_CONFIG = {
-    "a": "vllm_omni/deploy/mammoth_moda2_ar.yaml",
-    "b1": "vllm_omni/deploy/mammoth_moda2_ar_prefix_cache.yaml",
-    "b2": "vllm_omni/deploy/mammoth_moda2_ar_prefix_cache.yaml",
-}
+DEPLOY_CONFIG = "vllm_omni/deploy/mammoth_moda2_ar.yaml"
+SCENARIOS = ("a", "b1", "b2")
 
 
 def percentile(values: list[float], quantile: float) -> float:
@@ -219,7 +216,7 @@ def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenario", choices=SCENARIO_CONFIG, required=True)
+    parser.add_argument("--scenario", choices=SCENARIOS, required=True)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--prompt-repeat", type=int, default=1)
@@ -250,11 +247,12 @@ def main() -> None:
 
     pynvml.nvmlInit()
     device_handle, device_uuid = resolve_nvml_device(args.device_index)
-    deploy_config = REPO_ROOT / SCENARIO_CONFIG[args.scenario]
+    deploy_config = REPO_ROOT / DEPLOY_CONFIG
     stage_overrides = {
         "0": {
             "block_size": args.block_size,
             "devices": str(args.device_index),
+            "enable_prefix_caching": args.scenario != "a",
         }
     }
     if args.profile_dir is not None:
@@ -311,6 +309,7 @@ def main() -> None:
             "scenario": args.scenario,
             "model": args.model,
             "deploy_config": str(deploy_config.relative_to(REPO_ROOT)),
+            "stage_overrides": stage_overrides,
             "prompt": args.prompt,
             "prompt_repeat": args.prompt_repeat,
             "image_size": [args.height, args.width],
