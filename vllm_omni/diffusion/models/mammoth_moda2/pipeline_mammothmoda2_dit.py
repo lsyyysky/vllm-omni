@@ -374,11 +374,13 @@ class MammothModa2DiTPipeline(
         self.od_config = od_config
         self.parallel_config = od_config.parallel_config
         cache_backend = str(getattr(od_config, "cache_backend", "") or "").lower()
-        if (self.parallel_config.cfg_parallel_size or 1) > 1 and cache_backend == "cache_dit":
+        cfg_parallel = (self.parallel_config.cfg_parallel_size or 1) > 1
+        if cfg_parallel and cache_backend == "cache_dit":
             raise NotImplementedError(
                 "MammothModa2 does not support Cache-DiT with CFG parallelism because "
                 "Cache-DiT relies on sequential conditional/unconditional call parity."
             )
+        self._teacache_requires_paired_cfg = cfg_parallel and cache_backend == "tea_cache"
         self.device = get_local_device()
         self.config = _build_mammoth_config(od_config)
         self.weights_sources = [_root_weight_source(od_config)]
@@ -933,6 +935,11 @@ class MammothModa2DiTPipeline(
         # Precompute timesteps in latent dtype to eliminate per-step cast overhead
         timesteps_dtype = scheduler.timesteps.to(latents.dtype)
 
+        # TeaCache state is rank-local under CFG parallelism. Once ranks split into
+        # positive/negative branches, a CFG-off step would make every rank run the
+        # positive branch from a different cache history, so keep later steps paired.
+        cfg_started = False
+
         # Run diffusion loop (CFG supported when text_guidance_scale > 1.0)
         for i, t in enumerate(scheduler.timesteps):
             timestep = timesteps_dtype[i].expand(batch)
@@ -949,6 +956,9 @@ class MammothModa2DiTPipeline(
             }
             run_uncond = (any_active_per_step is not None and any_active_per_step[i]) if needs_uncond else False
             if requires_paired_cfg and negative_prompt_embeds is not None:
+                run_uncond = True
+            cfg_started = cfg_started or run_uncond
+            if self._teacache_requires_paired_cfg and cfg_started:
                 run_uncond = True
             negative_kwargs = None
             if run_uncond:
