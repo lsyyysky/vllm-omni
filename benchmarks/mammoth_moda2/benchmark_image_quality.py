@@ -101,7 +101,6 @@ def run_scenario(args: argparse.Namespace) -> None:
     omni = Omni(
         model=args.model,
         deploy_config=DEPLOY_CONFIGS[args.scenario],
-        mode="text-to-image",
     )
     records = []
     try:
