@@ -483,7 +483,24 @@ def test_forward_returns_diffusion_output_with_request_sampling(mocker) -> None:
     assert pipeline.gen_transformer.calls == 2
 
 
-def test_batched_cfg_parallel_matches_sequential_with_mixed_scales_and_ranges(monkeypatch) -> None:
+def test_cfg_parallel_validity_uses_group_max_and_skips_dummy(mocker) -> None:
+    pipeline = _pipeline_shell()
+    check = mocker.patch.object(pipeline, "check_cfg_parallel_validity", return_value=True)
+
+    pipeline._check_cfg_parallel_group(
+        ["cfg", "no-cfg"],
+        [4.0, 1.0],
+    )
+
+    check.assert_called_once_with(4.0, has_neg_prompt=True)
+    check.reset_mock()
+
+    pipeline._check_cfg_parallel_group(["dummy_req_id"], [0.0])
+
+    check.assert_not_called()
+
+
+def test_batched_cfg_parallel_matches_sequential_with_mixed_scales(monkeypatch) -> None:
     module = pipeline_mammothmoda2_dit
     monkeypatch.setattr(module, "FlowMatchEulerDiscreteScheduler", _FakeScheduler)
     monkeypatch.setattr(
@@ -505,14 +522,14 @@ def test_batched_cfg_parallel_matches_sequential_with_mixed_scales_and_ranges(mo
             ),
         ).requests[0],
         _batch(
-            request_id="cfg-first-step",
+            request_id="cfg-higher-scale",
             sampling=OmniDiffusionSamplingParams(
                 height=32,
                 width=48,
                 seed=2,
                 guidance_scale=7.0,
                 num_inference_steps=2,
-                extra_args={"cfg_range": [0.0, 0.25]},
+                extra_args={"cfg_range": [0.0, 1.0]},
             ),
         ).requests[0],
     ]
@@ -534,7 +551,7 @@ def test_batched_cfg_parallel_matches_sequential_with_mixed_scales_and_ranges(mo
     sequential_outputs, sequential_branches = run_pipeline()
     assert sequential_branches == [4, 0, 4, 0]
     torch.testing.assert_close(sequential_outputs[0].output, torch.full((1, 3, 32, 48), -55.0))
-    torch.testing.assert_close(sequential_outputs[1].output, torch.full((1, 3, 32, 48), -10.0))
+    torch.testing.assert_close(sequential_outputs[1].output, torch.full((1, 3, 32, 48), -100.0))
 
     for rank, expected_branch_length in ((0, 4), (1, 0)):
         fake_group = _TwoBranchCfgGroup(rank)
@@ -1262,7 +1279,7 @@ def _step_state(batch: DiffusionRequestBatch) -> StepRequestState:
     )
 
 
-def test_step_cfg_parallel_matches_sequential_with_mixed_scales_and_ranges(monkeypatch) -> None:
+def test_step_cfg_parallel_matches_sequential_with_mixed_scales(monkeypatch) -> None:
     monkeypatch.setattr(
         pipeline_mammothmoda2_dit,
         "randn_tensor",
@@ -1281,43 +1298,53 @@ def test_step_cfg_parallel_matches_sequential_with_mixed_scales_and_ranges(monke
             ),
         ).requests[0],
         _batch(
-            request_id="cfg-first-step",
+            request_id="cfg-higher-scale",
             sampling=OmniDiffusionSamplingParams(
                 height=32,
                 width=48,
                 seed=2,
                 guidance_scale=7.0,
                 num_inference_steps=2,
-                extra_args={"cfg_range": [0.0, 0.25]},
+                extra_args={"cfg_range": [0.0, 1.0]},
             ),
         ).requests[0],
     ]
 
-    def run_step() -> tuple[torch.Tensor, list[int]]:
+    def run_step() -> tuple[torch.Tensor, list[int], list[tuple[float, bool]]]:
         pipeline = _pipeline_shell()
         transformer = _CfgSignalTransformer()
         pipeline.gen_transformer = transformer
         pipeline.gen_image_condition_refiner = None
         pipeline.gen_freqs_cis = torch.zeros(1)
+        validity_calls: list[tuple[float, bool]] = []
+        monkeypatch.setattr(
+            pipeline,
+            "check_cfg_parallel_validity",
+            lambda scale, has_neg_prompt: validity_calls.append((scale, has_neg_prompt)),
+        )
         states = [pipeline.prepare_encode(_step_state(DiffusionRequestBatch([request]))) for request in requests]
         for state in states:
             state.step_index = 1
         predictions = pipeline.denoise_step(InputBatch.make_batch(states), states=states)
-        return predictions, transformer.branch_token_lengths
+        return predictions, transformer.branch_token_lengths, validity_calls
 
     from vllm_omni.diffusion.distributed import parallel_state
 
     monkeypatch.setattr(parallel_state, "_CFG", None)
-    sequential, sequential_branches = run_step()
+    sequential, sequential_branches, validity_calls = run_step()
     assert sequential_branches == [4, 0]
+    assert validity_calls == [(7.0, True)]
+    torch.testing.assert_close(sequential[0], torch.full_like(sequential[0], 55.0))
+    torch.testing.assert_close(sequential[1], torch.full_like(sequential[1], 100.0))
 
     for rank, expected_branch_length in ((0, 4), (1, 0)):
         fake_group = _TwoBranchCfgGroup(rank)
         _patch_cfg_parallel_state(monkeypatch, rank=rank, fake_group=fake_group)
-        parallel, rank_branches = run_step()
+        parallel, rank_branches, validity_calls = run_step()
 
         assert rank_branches == [expected_branch_length]
         assert fake_group.gather_calls == 1
+        assert validity_calls == [(7.0, True)]
         torch.testing.assert_close(parallel, sequential, rtol=0, atol=0)
 
 

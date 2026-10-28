@@ -882,6 +882,24 @@ class MammothModa2DiTPipeline(
         )
         return scheduler
 
+    def _check_cfg_parallel_group(
+        self,
+        request_ids: Sequence[str],
+        guidance_scales: Sequence[float],
+    ) -> None:
+        real_scales = [
+            scale
+            for request_id, scale in zip(request_ids, guidance_scales, strict=True)
+            if not OmniDiffusionRequest.is_dummy_run_request_id(request_id)
+        ]
+        if not real_scales:
+            return
+        max_scale = max(real_scales)
+        self.check_cfg_parallel_validity(
+            max_scale,
+            has_neg_prompt=max_scale > 1.0,
+        )
+
     def _denoise_group(
         self,
         specs: list[_MammothRequest],
@@ -902,11 +920,10 @@ class MammothModa2DiTPipeline(
         # all rows; rows that never take the CFG branch select their cond
         # prediction directly via torch.where below.
         needs_uncond = any(s.text_guidance_scale > 1.0 for s in specs)
-        for spec in specs:
-            self.check_cfg_parallel_validity(
-                spec.text_guidance_scale,
-                has_neg_prompt=spec.text_guidance_scale > 1.0,
-            )
+        self._check_cfg_parallel_group(
+            [spec.request_id for spec in specs],
+            [spec.text_guidance_scale for spec in specs],
+        )
         negative_prompt_embeds = None
         negative_prompt_attention_mask = None
         if needs_uncond:
@@ -1062,10 +1079,6 @@ class MammothModa2DiTPipeline(
         del kwargs
         prompt = state.prompt if isinstance(state.prompt, dict) else {}
         spec = self._parse_request_inputs(prompt, state.sampling, state.request_id)
-        self.check_cfg_parallel_validity(
-            spec.text_guidance_scale,
-            has_neg_prompt=spec.text_guidance_scale > 1.0,
-        )
         text_cond, image_cond = self._split_request_conditions(spec)
 
         model_device, target_dtype = self._model_device_and_dtype()
@@ -1105,6 +1118,7 @@ class MammothModa2DiTPipeline(
                 "mammoth_ar_image_attention_mask": ar_image_attention_mask,
                 "mammoth_text_guidance_scale": spec.text_guidance_scale,
                 "mammoth_cfg_range": spec.cfg_range,
+                "mammoth_cfg_parallel_validated": False,
             }
         )
         return state
@@ -1139,6 +1153,13 @@ class MammothModa2DiTPipeline(
         batch_size = int(input_batch.latents.shape[0])
         timesteps = input_batch.timesteps.reshape(-1).expand(batch_size).to(input_batch.latents.dtype)
         guidance_scales = [float(state.extra["mammoth_text_guidance_scale"]) for state in batch_states]
+        if any(not state.extra["mammoth_cfg_parallel_validated"] for state in batch_states):
+            self._check_cfg_parallel_group(
+                [state.request_id for state in batch_states],
+                guidance_scales,
+            )
+            for state in batch_states:
+                state.extra["mammoth_cfg_parallel_validated"] = True
         active_cfg = []
         for state, guidance_scale in zip(batch_states, guidance_scales):
             cfg_start, cfg_end = state.extra["mammoth_cfg_range"]

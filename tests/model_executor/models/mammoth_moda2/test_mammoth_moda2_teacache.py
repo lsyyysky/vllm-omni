@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -15,7 +18,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-pytestmark = [pytest.mark.cpu]
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_mammoth_moda2_calibrated_teacache_defaults():
@@ -81,6 +84,7 @@ def _build_pipeline(monkeypatch):
     pipe._llm_hidden_size = 8
     pipe._cache_dit_config = None
     pipe._cache_dit_runtime = RequestScopedCacheDiTRuntime(pipe)
+    pipe._teacache_requires_paired_cfg = False
     pipe.config = SimpleNamespace(
         llm_config=SimpleNamespace(gen_vocab_start_index=100),
         image_token_id=900,

@@ -11,7 +11,7 @@ the portable golden/stability oracle remains tracked in #7090.
 Model Hub repo id: ``bytedance-research/MammothModa2-Preview``.
 Deploy config: ``get_deploy_config_path("mammoth_moda2.yaml")`` -> ``vllm_omni/deploy/mammoth_moda2.yaml``
 
-Golden pixel file: ``tests/e2e/offline_inference/fixtures/mammoth_moda2_t2i_golden.json``
+Golden pixel files: ``tests/e2e/offline_inference/fixtures/mammoth_moda2_t2i_<case>_golden.json``
   Regenerate with: ``UPDATE_GOLDEN=1 pytest tests/e2e/offline_inference/test_mammoth_moda2_expansion.py``
 """
 
@@ -49,11 +49,13 @@ CFG_PARALLEL_DEPLOY_CONFIG = modify_stage_config(
     T2I_DEPLOY_CONFIG,
     updates={"stages": {1: {"devices": "0,1"}}},
 )
+_GOLDEN_T2I_DIR = Path(__file__).parent / "fixtures"
 
 _E2E_PARAMS = [
     pytest.param(
         (MODEL_PATH, T2I_DEPLOY_CONFIG, {"cfg_parallel_size": 1}),
         1.0,
+        "cfg1-no-cfg",
         marks=hardware_marks(res={"cuda": "H100"}, num_cards=1),
         id="cfg1-no-cfg",
     ),
@@ -64,13 +66,12 @@ _E2E_PARAMS = [
             {"cfg_parallel_size": 2},
         ),
         9.0,
+        "cfg2",
         marks=hardware_marks(res={"cuda": "H100"}, num_cards=2),
         id="cfg2",
     ),
 ]
 
-# Optional golden pixel reference file. Set UPDATE_GOLDEN=1 to regenerate.
-_GOLDEN_T2I_PATH = Path(__file__).parent / "fixtures" / "mammoth_moda2_t2i_golden.json"
 # Fixed sampling coordinates: (channel, row_fraction, col_fraction)
 # Covers corners, centre, and mid-edges across all 3 channels.
 _PIXEL_SAMPLE_COORDS = [
@@ -151,13 +152,14 @@ def test_diffusion_output_exposes_images_at_top_level():
 @pytest.mark.slow
 @pytest.mark.diffusion
 @pytest.mark.parametrize(
-    ("omni_runner", "text_guidance_scale"),
+    ("omni_runner", "text_guidance_scale", "golden_case"),
     _E2E_PARAMS,
     indirect=["omni_runner"],
 )
 def test_mammothmoda2_t2i_e2e(
     omni_runner: OmniRunner,
     text_guidance_scale: float,
+    golden_case: str,
 ):
     """
     End-to-end text-to-image generation with MammothModa2 (AR -> DiT).
@@ -237,12 +239,13 @@ def test_mammothmoda2_t2i_e2e(
     assert image.size == (width, height)
 
     sampled = _sample_pixels(_pil_to_tensor(image))
+    golden_path = _GOLDEN_T2I_DIR / f"mammoth_moda2_t2i_{golden_case}_golden.json"
 
     if os.environ.get("UPDATE_GOLDEN"):
-        _GOLDEN_T2I_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _GOLDEN_T2I_PATH.write_text(json.dumps({"pixels": sampled}, indent=2))
-        print(f"\nGolden file written to {_GOLDEN_T2I_PATH}")
-    elif _GOLDEN_T2I_PATH.exists():
-        golden = json.loads(_GOLDEN_T2I_PATH.read_text())["pixels"]
+        golden_path.parent.mkdir(parents=True, exist_ok=True)
+        golden_path.write_text(json.dumps({"pixels": sampled}, indent=2))
+        print(f"\nGolden file written to {golden_path}")
+    elif golden_path.exists():
+        golden = json.loads(golden_path.read_text())["pixels"]
         for i, (got, exp) in enumerate(zip(sampled, golden)):
             assert abs(got - exp) < 1e-4, f"Pixel {i} mismatch: got {got}, expected {exp}"
