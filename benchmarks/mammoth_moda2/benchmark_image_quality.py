@@ -16,6 +16,7 @@ from transformers import CLIPModel, CLIPProcessor
 from vllm import SamplingParams
 
 from vllm_omni import Omni
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_extras import (
     build_text_to_image_prompt,
     get_model_class_name,
@@ -32,23 +33,26 @@ DEPLOY_CONFIGS = {
     "b2": "vllm_omni/deploy/mammoth_moda2_prefix_cache.yaml",
 }
 CLIP_MODEL = "openai/clip-vit-base-patch32"
+IMAGE_SIZE = 256
+NUM_INFERENCE_STEPS = 50
+GUIDANCE_SCALE = 9.0
 
 
 def build_request(
     omni: Omni,
     prompt: str,
     seed: int,
-) -> tuple[dict, list[SamplingParams]]:
+) -> tuple[dict, list[SamplingParams | OmniDiffusionSamplingParams]]:
     request = build_text_to_image_prompt(
         model_class_name=get_model_class_name(omni),
         prompt={"prompt": prompt, "modalities": ["image"]},
-        height=256,
-        width=256,
+        height=IMAGE_SIZE,
+        width=IMAGE_SIZE,
     )
     request["additional_information"].update(
         {
-            "num_inference_steps": [50],
-            "text_guidance_scale": [9.0],
+            "num_inference_steps": [NUM_INFERENCE_STEPS],
+            "text_guidance_scale": [GUIDANCE_SCALE],
             "cfg_range": [0.0, 1.0],
         }
     )
@@ -63,27 +67,33 @@ def build_request(
             max_tokens=ar_height * (ar_width + 1) + 1,
             detokenize=False,
         ),
-        SamplingParams(
-            temperature=0.0,
+        OmniDiffusionSamplingParams(
+            height=IMAGE_SIZE,
+            width=IMAGE_SIZE,
             seed=seed,
-            max_tokens=1,
-            detokenize=False,
+            guidance_scale=GUIDANCE_SCALE,
+            num_inference_steps=NUM_INFERENCE_STEPS,
+            extra_args={"cfg_range": [0.0, 1.0]},
         ),
     ]
 
 
-def generate(omni: Omni, request: dict, params: list[SamplingParams]) -> np.ndarray:
+def generate(
+    omni: Omni,
+    request: dict,
+    params: list[SamplingParams | OmniDiffusionSamplingParams],
+) -> np.ndarray:
     output = omni.generate(
         request,
         sampling_params_list=params,
         use_tqdm=False,
     )[0]
-    image = output.multimodal_output["image"]
-    if isinstance(image, list):
-        image = image[0]
-    if not isinstance(image, torch.Tensor):
+    if not output.images:
+        raise RuntimeError("MammothModa2 generation returned no images")
+    image = output.images[0]
+    if not isinstance(image, Image.Image):
         raise TypeError(type(image))
-    return image.detach().cpu().float().numpy()
+    return np.asarray(image.convert("RGB"), dtype=np.float32).transpose(2, 0, 1) / 255.0
 
 
 def run_scenario(args: argparse.Namespace) -> None:
@@ -119,7 +129,9 @@ def run_scenario(args: argparse.Namespace) -> None:
 
 def _normalized_image(path: Path) -> np.ndarray:
     image = np.load(path).astype(np.float32)
-    return np.clip(image / 2 + 0.5, 0, 1)
+    if image.ndim != 3 or image.shape[0] != 3:
+        raise ValueError(f"expected a CHW RGB image, got shape={image.shape}")
+    return np.clip(image, 0, 1)
 
 
 def _pil_image(image: np.ndarray) -> Image.Image:
