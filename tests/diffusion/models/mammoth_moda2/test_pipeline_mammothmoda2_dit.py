@@ -138,7 +138,6 @@ def _pipeline_shell() -> MammothModa2DiTPipeline:
     # matching a pipeline built without a cache_backend).
     pipeline._cache_dit_runtime = RequestScopedCacheDiTRuntime(pipeline)
     pipeline._cache_dit_config = None
-    pipeline._teacache_requires_paired_cfg = False
     return pipeline
 
 
@@ -564,73 +563,6 @@ def test_batched_cfg_parallel_matches_sequential_with_mixed_scales(monkeypatch) 
             torch.testing.assert_close(actual.output, expected.output, rtol=0, atol=0)
 
 
-def test_teacache_cfg_parallel_keeps_branches_paired_after_cfg_starts(monkeypatch) -> None:
-    module = pipeline_mammothmoda2_dit
-    monkeypatch.setattr(module, "FlowMatchEulerDiscreteScheduler", _FakeScheduler)
-    monkeypatch.setattr(
-        module,
-        "randn_tensor",
-        lambda shape, **kwargs: torch.zeros(shape, device=kwargs["device"], dtype=kwargs["dtype"]),
-    )
-
-    # Four steps at frac 0, 0.25, 0.5, 0.75: CFG is off before it starts,
-    # on at step 1, off for the whole batch at step 2, and on again at step 3.
-    requests = [
-        _batch(
-            request_id="cfg-early",
-            sampling=OmniDiffusionSamplingParams(
-                height=32,
-                width=48,
-                seed=1,
-                guidance_scale=4.0,
-                num_inference_steps=4,
-                extra_args={"cfg_range": [0.2, 0.3]},
-            ),
-        ).requests[0],
-        _batch(
-            request_id="cfg-late",
-            sampling=OmniDiffusionSamplingParams(
-                height=32,
-                width=48,
-                seed=2,
-                guidance_scale=7.0,
-                num_inference_steps=4,
-                extra_args={"cfg_range": [0.7, 1.0]},
-            ),
-        ).requests[0],
-    ]
-    request_batch = DiffusionRequestBatch(requests)
-
-    def run_pipeline(teacache_requires_paired_cfg: bool) -> tuple[list[DiffusionOutput], list[int]]:
-        pipeline = _pipeline_shell()
-        pipeline._teacache_requires_paired_cfg = teacache_requires_paired_cfg
-        transformer = _CfgSignalTransformer()
-        pipeline.gen_transformer = transformer
-        pipeline.gen_image_condition_refiner = None
-        pipeline.gen_vae = _FakeVae()
-        pipeline.gen_freqs_cis = torch.zeros(1)
-        outputs = pipeline.forward(request_batch)
-        return outputs, transformer.branch_token_lengths
-
-    from vllm_omni.diffusion.distributed import parallel_state
-
-    monkeypatch.setattr(parallel_state, "_CFG", None)
-    sequential_outputs, sequential_branches = run_pipeline(False)
-    assert sequential_branches == [4, 4, 0, 4, 4, 0]
-
-    for rank, expected_branches in ((0, [4, 4, 4, 4]), (1, [4, 0, 0, 0])):
-        fake_group = _TwoBranchCfgGroup(rank)
-        _patch_cfg_parallel_state(monkeypatch, rank=rank, fake_group=fake_group)
-        rank_outputs, rank_branches = run_pipeline(True)
-
-        # Rank 1 never runs the positive branch once CFG has started, so no
-        # positive TeaCache state is created on it.
-        assert rank_branches == expected_branches
-        assert fake_group.gather_calls == 3
-        for actual, expected in zip(rank_outputs, sequential_outputs):
-            torch.testing.assert_close(actual.output, expected.output, rtol=0, atol=0)
-
-
 def test_forward_rejects_missing_visual_tokens_before_model_access() -> None:
     prompt = {
         "prompt": "",
@@ -697,11 +629,19 @@ def _cache_dit_od_config() -> OmniDiffusionConfig:
     )
 
 
-def test_init_rejects_cache_dit_with_cfg_parallel() -> None:
+@pytest.mark.parametrize(
+    ("cache_backend", "error"),
+    [
+        ("cache_dit", "does not support Cache-DiT with CFG parallelism"),
+        ("tea_cache", "does not support TeaCache with CFG parallelism"),
+    ],
+)
+def test_init_rejects_cache_backend_with_cfg_parallel(cache_backend: str, error: str) -> None:
     config = _cache_dit_od_config()
+    config.cache_backend = cache_backend
     config.parallel_config.cfg_parallel_size = 2
 
-    with pytest.raises(NotImplementedError, match="does not support Cache-DiT with CFG parallelism"):
+    with pytest.raises(NotImplementedError, match=error):
         MammothModa2DiTPipeline(od_config=config)
 
 

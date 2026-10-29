@@ -84,7 +84,6 @@ def _build_pipeline(monkeypatch):
     pipe._llm_hidden_size = 8
     pipe._cache_dit_config = None
     pipe._cache_dit_runtime = RequestScopedCacheDiTRuntime(pipe)
-    pipe._teacache_requires_paired_cfg = False
     pipe.config = SimpleNamespace(
         llm_config=SimpleNamespace(gen_vocab_start_index=100),
         image_token_id=900,

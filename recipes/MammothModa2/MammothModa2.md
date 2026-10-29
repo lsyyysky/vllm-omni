@@ -25,8 +25,8 @@ requests (`max_num_seqs: 8`) and one image per request
 cache backends in request mode. Enable TeaCache with `--cache-backend tea_cache`
 as shown below, or enable Cache-DiT using the commented settings in that YAML.
 Two-device CFG parallelism is available in request and step modes, but cannot
-be combined with Cache-DiT. Compilation, DiT quantization, other parallel
-strategies, and offload are not enabled by these presets.
+be combined with Cache-DiT or TeaCache. Compilation, DiT quantization, other
+parallel strategies, and offload are not enabled by these presets.
 
 To use step execution and continuous batching, select
 [`mammoth_moda2_step.yaml`](../../vllm_omni/deploy/mammoth_moda2_step.yaml)
@@ -70,7 +70,7 @@ the measured results are summarized below.
 To run the positive and negative guidance branches in parallel, assign two
 devices to the DiT stage (for example, `devices: "0,1"`) and pass
 `--cfg-parallel-size 2` to the shared text-to-image example. Do not configure
-`cache_backend: cache_dit` in this mode.
+`cache_backend: cache_dit` or `--cache-backend tea_cache` in this mode.
 
 ## GPU
 
