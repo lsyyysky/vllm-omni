@@ -82,6 +82,7 @@ class RecordingStagePort(DuplexStagePort):
         #: When set, ``submit`` parks on it after signalling ``submit_started``.
         self.submit_gate: asyncio.Event | None = None
         self.submit_started = asyncio.Event()
+        self.cleanup_failures_remaining = 0
 
     @property
     def stage_count(self) -> int:
@@ -108,6 +109,9 @@ class RecordingStagePort(DuplexStagePort):
 
     async def cleanup(self, request_ids: list[str], *, abort: bool = False) -> None:
         self.cleanups.append((list(request_ids), abort))
+        if self.cleanup_failures_remaining:
+            self.cleanup_failures_remaining -= 1
+            raise RuntimeError("transient cleanup failure")
 
     async def abort_requests(self, request_ids: list[str]) -> None:
         self.aborts.append(list(request_ids))
@@ -370,6 +374,12 @@ def listen_output(request_id: str) -> SimpleNamespace:
         ],
         multimodal_output={"meta.listen_token_id": LISTEN_TOKEN_ID},
     )
+
+
+def _is_silence_unit(submission: DuplexStageSubmission) -> bool:
+    """A continuation unit: the only append whose audio is all zeros."""
+    payload = submission.prompt["model_intermediate_buffer"]["duplex"]["payload"]
+    return set(base64.b64decode(payload["audio"])) == {0}
 
 
 def types(events: Sequence[DuplexEvent]) -> list[str]:
@@ -776,6 +786,287 @@ async def test_clear_input_drops_buffered_audio() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["decode", "vad"])
+@pytest.mark.parametrize("fails", [False, True])
+async def test_audio_admission_is_held_until_preprocessing_finishes(monkeypatch, phase, fails) -> None:
+    h = await open_harness(
+        auto_response=False,
+        runtime_config=DuplexSessionRuntimeConfig(max_pending_input_bytes_per_session=64_000),
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+    owner = h.runner if phase == "decode" else h.runner.control
+    method = "offload" if phase == "decode" else "run_turn_detection"
+    original = getattr(owner, method)
+    on_command = h.runner._on_command
+
+    async def track_command(command):
+        try:
+            await on_command(command)
+        finally:
+            finished.set()
+
+    async def blocked(*args, **kwargs):
+        started.set()
+        await release.wait()
+        if fails:
+            raise ValueError("preprocessing failed")
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, method, blocked)
+    monkeypatch.setattr(h.runner, "_on_command", track_command)
+    try:
+        h.submit(append_audio(samples=8000))
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        assert h.session.pending_input_bytes == 32_000
+        h.submit(append_audio(samples=10_000, event_id="over-limit"))
+        events = await h.settle()
+        assert any(
+            event.type == "error" and event.code == "input_backpressure" and event.related_event_id == "over-limit"
+            for event in events
+        )
+
+        release.set()
+        await asyncio.wait_for(finished.wait(), timeout=2.0)
+        events = await h.settle()
+        assert h.session.pending_input_bytes == (0 if fails else 32_000)
+        assert h.session._input.queued_input_bytes == 0
+        if fails:
+            assert any(event.type == "error" and "preprocessing failed" in event.message for event in events)
+        else:
+            assert h.runner.model_state.audio_buffer.pending_byte_count == 32_000
+        await h.run(commands.ClearInput())
+        assert h.session.pending_input_bytes == 0
+    finally:
+        release.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("committed", [False, True])
+async def test_clear_input_preserves_queued_append_byte_reservations(monkeypatch, committed) -> None:
+    h = await open_harness(
+        auto_response=False,
+        runtime_config=DuplexSessionRuntimeConfig(max_pending_input_bytes_per_session=64_000),
+    )
+    blocked = asyncio.Event()
+    resume = asyncio.Event()
+    on_command = h.runner._on_command
+
+    async def pause_queued_append(command):
+        if command.event_id == "queued":
+            blocked.set()
+            await resume.wait()
+        await on_command(command)
+
+    try:
+        await h.run(append_audio(samples=8000))
+        if committed:
+            await h.run(commands.Commit(create_response=False))
+            assert h.runner.model_state.committed_audio_reserved_bytes == 32_000
+        assert h.session.pending_input_bytes == 32_000
+        monkeypatch.setattr(h.runner, "_on_command", pause_queued_append)
+        h.submit(commands.ClearInput())
+        h.submit(append_audio(samples=8000, event_id="queued"))
+        assert h.session.pending_input_bytes == 64_000
+        await asyncio.wait_for(blocked.wait(), timeout=2.0)
+
+        # Only the old buffer was cleared; the later append still owns its budget.
+        assert h.session.pending_input_bytes == 32_000
+        assert not h.runner.model_state.audio_buffer.has_pending()
+        assert h.runner.model_state.committed_audio_reserved_bytes == 0
+        h.submit(append_audio(samples=10_000, event_id="over-limit"))
+        events = await h.settle()
+        assert any(
+            event.type == "error" and event.code == "input_backpressure" and event.related_event_id == "over-limit"
+            for event in events
+        )
+
+        resume.set()
+        await h.settle()
+        assert h.session.pending_input_bytes == 32_000
+        assert h.runner.model_state.audio_buffer.pending_byte_count == 32_000
+        await h.run(commands.ClearInput())
+        assert h.session.pending_input_bytes == 0
+    finally:
+        resume.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_cleared_in_flight_append_cannot_release_later_audio(monkeypatch) -> None:
+    h = await open_harness()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    processed = asyncio.Event()
+    submit = h.port.submit
+    on_command = h.runner._on_command
+
+    async def blocked_submit(submission):
+        started.set()
+        await release.wait()
+        return await submit(submission)
+
+    async def observe_command(command):
+        await on_command(command)
+        if command.event_id == "later":
+            processed.set()
+
+    monkeypatch.setattr(h.port, "submit", blocked_submit)
+    monkeypatch.setattr(h.runner, "_on_command", observe_command)
+    try:
+        h.submit(append_audio())
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        assert h.session.pending_input_bytes == 64_000
+        h.submit(commands.ClearInput())
+        h.submit(append_audio(samples=8000, event_id="later"))
+        await asyncio.wait_for(processed.wait(), timeout=2.0)
+        assert h.session.pending_input_bytes == 32_000
+        release.set()
+        await h.settle()
+        assert h.session.pending_input_bytes == 32_000
+        assert h.runner.model_state.audio_buffer.pending_byte_count == 32_000
+    finally:
+        release.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_append_chained_behind_a_cleared_append_still_submits() -> None:
+    h = await open_harness()
+    h.port.submit_gate = asyncio.Event()
+    try:
+        before = len(h.port.submissions)
+        h.submit(append_audio(event_id="in-flight"))
+        await asyncio.wait_for(h.port.submit_started.wait(), timeout=2.0)
+        h.submit(append_audio(event_id="cleared"))
+        h.submit(commands.ClearInput())
+        h.submit(append_audio(event_id="after-clear"))
+        for _ in range(200):
+            if h.runner._mailbox.empty() and len(h.runner.tasks.append_tasks) == 3:
+                break
+            await asyncio.sleep(0.005)
+        assert len(h.runner.tasks.append_tasks) == 3
+
+        h.port.submit_gate.set()
+        await h.settle()
+        # The cleared append is called off; the one behind it is not rolled back.
+        assert len(h.port.submissions) == before + 2
+        assert not h.runner.model_state.audio_buffer.has_pending()
+        assert h.session.pending_input_bytes == 0
+    finally:
+        h.port.submit_gate.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_admitted_pcm16_append_that_decodes_past_the_limit_is_rejected_cleanly() -> None:
+    h = await open_harness(
+        auto_response=False,
+        runtime_config=DuplexSessionRuntimeConfig(max_pending_input_bytes_per_session=40_000),
+    )
+    try:
+        pcm16 = np.full(16000, 1600, dtype="<i2").tobytes()  # 32_000 wire bytes, 64_000 as f32
+        events = await h.run(commands.AppendAudio(audio=pcm16, format="pcm16", sample_rate_hz=16000, is_speech=True))
+        # Admission passes on wire bytes; the PCM handoff enforces the limit on the decoded size.
+        assert any(event.type == "error" and event.code == "input_backpressure" for event in events)
+        assert not h.runner.model_state.audio_buffer.has_pending()
+        assert not h.runner.model_state.input_since_commit
+        assert h.session.pending_input_bytes == 0
+        # Nothing stays charged, so audio that fits is still accepted.
+        await h.run(append_audio(samples=8000))
+        assert h.session.pending_input_bytes == h.runner.model_state.audio_buffer.pending_byte_count == 32_000
+    finally:
+        await close_harness(h)
+
+
+class _SplitDetector:
+    """Splits every append into one 1 s segment and its remainder."""
+
+    def process_segments(self, base64_audio: str, *, fmt: str, sample_rate_hz: int | None):
+        from vllm_omni.engine.duplex.turn_detection import TurnDetectionResult, TurnDetectionSegment
+
+        del fmt, sample_rate_hz
+        audio = base64.b64decode(base64_audio)
+        result = TurnDetectionResult(is_speech=True, speech_active=True)
+        return [
+            TurnDetectionSegment(base64.b64encode(part).decode(), result) for part in (audio[:64_000], audio[64_000:])
+        ]
+
+    def reset(self) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fails", [False, True])
+async def test_vad_split_append_keeps_unprocessed_segments_charged(monkeypatch, fails) -> None:
+    h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(max_pending_input_bytes_per_session=120_000))
+    h.runner.control._detector = _SplitDetector()
+    h.port.submit_gate = asyncio.Event()
+    handed_off = asyncio.Event()
+    resume = asyncio.Event()
+    start_append = h.runner._start_append
+
+    async def pause_after_first_handoff(*args, **kwargs):
+        task = await start_append(*args, **kwargs)
+        if not handed_off.is_set():
+            handed_off.set()
+            await resume.wait()
+            if fails:
+                raise RuntimeError("append failed after handoff")
+        return task
+
+    monkeypatch.setattr(h.runner, "_start_append", pause_after_first_handoff)
+    try:
+        # 96_000 bytes: the first 1 s segment is handed off and its stage
+        # submission stays pending; the 32_000-byte tail is not processed yet.
+        h.submit(append_audio(samples=24_000))
+        await asyncio.wait_for(handed_off.wait(), timeout=2.0)
+        assert h.session.pending_input_bytes == 96_000
+        # Fits only if the unprocessed tail is forgotten.
+        h.submit(append_audio(samples=8000, event_id="over-limit"))
+        events = await h.settle(timeout_s=0.2)
+        assert any(
+            event.type == "error" and event.code == "input_backpressure" and event.related_event_id == "over-limit"
+            for event in events
+        )
+
+        resume.set()
+        h.port.submit_gate.set()
+        await h.settle()
+        # Every charge is released once: the tail is buffered, or released on failure.
+        assert h.session._input.queued_input_bytes == 0
+        assert h.session.pending_input_bytes == (0 if fails else 32_000)
+        await h.run(commands.ClearInput())
+        assert h.session.pending_input_bytes == 0
+    finally:
+        resume.set()
+        h.port.submit_gate.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("limit", "kept"), [(80_000, 64_000), (48_000, 32_000)])
+async def test_vad_split_append_past_the_limit_matches_main(limit, kept) -> None:
+    h = await open_harness(
+        auto_response=False,
+        runtime_config=DuplexSessionRuntimeConfig(max_pending_input_bytes_per_session=limit),
+    )
+    h.runner.control._detector = _SplitDetector()
+    try:
+        pcm16 = np.full(24_000, 1600, dtype="<i2").tobytes()  # 48_000 wire bytes, 64_000 + 32_000 as f32
+        events = await h.run(commands.AppendAudio(audio=pcm16, format="pcm16", sample_rate_hz=16000, is_speech=True))
+        # Each segment is checked as on main: the still-queued tail never blocks an
+        # earlier segment, so only the segment that does not fit is rejected.
+        assert [event.code for event in events if event.type == "error"] == ["input_backpressure"]
+        assert h.session.pending_input_bytes == h.runner.model_state.audio_buffer.pending_byte_count == kept
+        assert h.session._input.queued_input_bytes == 0
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_commit_without_audio_is_rejected() -> None:
     h = await open_harness()
     try:
@@ -1002,6 +1293,35 @@ async def test_stale_epoch_output_is_dropped_after_barge_in() -> None:
         await close_harness(h)
 
 
+@pytest.mark.parametrize("fail_cleanup", [False, True])
+async def test_barge_in_releases_only_successfully_cleaned_request_ids(
+    fail_cleanup: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = await open_harness()
+    original_cleanup = h.port.cleanup
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+
+        async def cleanup_with_new_resource(request_ids: list[str], *, abort: bool = False) -> None:
+            assert h.session.resource_request_ids(submitted=True) == [request_id]
+            await original_cleanup(request_ids, abort=abort)
+            h.session.bind_stage_request(0, "next-epoch-request", fence=h.session.fence)
+            if fail_cleanup:
+                raise RuntimeError("synthetic abort failure")
+
+        monkeypatch.setattr(h.port, "cleanup", cleanup_with_new_resource)
+        events = await h.run(commands.BargeIn())
+        assert h.session.epoch == 1
+        assert h.port.cleanups == [([request_id], True)]
+        assert "next-epoch-request" in h.session.resource_request_ids(submitted=True)
+        assert (request_id in h.session.resource_request_ids(submitted=True)) is fail_cleanup
+        assert any(getattr(event, "code", None) == "runtime_signal_failed" for event in events) is fail_cleanup
+    finally:
+        monkeypatch.setattr(h.port, "cleanup", original_cleanup)
+        await close_harness(h)
+
+
 async def test_barge_in_aborts_draining_tts_as_well_as_the_active_request() -> None:
     h = await open_harness()
     release_abort = asyncio.Event()
@@ -1090,6 +1410,91 @@ async def test_close_invalidates_draining_audio_before_stage_abort_finishes() ->
         assert h.manager.active_count() == 0
     finally:
         release_abort.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_cancel_cleanup_failure_retains_requests_for_close_retry() -> None:
+    h = await open_harness()
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="he"))
+        h.port.cleanup_failures_remaining = 1
+
+        events = await h.run(commands.BargeIn())
+
+        assert h.session.epoch == 1
+        assert find(events, "error").code == "runtime_signal_failed"
+        assert h.port.cleanups == [([request_id], True)]
+        assert h.session.resource_request_ids() == [request_id]
+
+        await h.manager.handle(
+            CloseDuplexSessionMessage(control_id="c-close", session_id=SESSION_ID, reason="client_close")
+        )
+        result = await asyncio.wait_for(h.results.get(), timeout=2.0)
+
+        assert result.ok and result.operation == "close"
+        assert h.port.cleanups == [([request_id], True), ([request_id], True)]
+        assert h.session.resource_request_ids() == []
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ended", [False, True])
+@pytest.mark.parametrize("native_signal", [False, True])
+async def test_audio_truncation_preserves_retrieved_and_terminal_transcript(ended, native_signal) -> None:
+    h = await open_harness()
+    try:
+        session = h.session
+        response = session.begin_response()
+        item_id = f"item_{response}"
+        h.runner.emit(h.runner.model.response_created_payload(response, epoch=session.epoch))
+        session.append_assistant_text("abcdefghij")
+        session.mark_audio_sent(10_000, text_chars=10, audio_complete=True)
+        h.runner.emit(
+            {
+                "type": "response.output_audio.delta",
+                "response_id": response,
+                "audio": "AAA=",
+                "text": "abcdefghij",
+                "audio_duration_ms": 10_000,
+                "audio_text_marks": [{"text_chars": 10, "audio_end_ms": 10_000}],
+            }
+        )
+        if ended:
+            session.register_history_item(item_id, session.end_response())
+            h.runner.emit({"type": "response.done", "response_id": response})
+        await h.settle()
+
+        if native_signal:
+            command = commands.SignalTurn(
+                event="conversation.item.truncate", signal_payload={"item_id": item_id, "audio_end_ms": 4_000}
+            )
+        else:
+            command = commands.TruncateItem(item_id=item_id, audio_end_ms=4_000)
+        events = await h.run(command)
+        assert "error" not in types(events)
+        assert find(events, "conversation.item.truncated").audio_end_ms == 4_000
+        for _ in range(2):
+            events = await h.run(
+                commands.SignalTurn(event="conversation.item.retrieve", signal_payload={"item_id": item_id})
+            )
+            assert find(events, "conversation.item.retrieved").item["content"][0]["transcript"] == "abcd"
+
+        if not ended:
+            session.register_history_item(item_id, session.end_response())
+            h.runner.emit({"type": "response.done", "response_id": response})
+            events = await h.settle()
+            done = find(events, "response.done")
+            assert done.response["output"][0]["content"][0]["transcript"] == "abcd"
+            events = await h.run(
+                commands.SignalTurn(event="conversation.item.retrieve", signal_payload={"item_id": item_id})
+            )
+            assert find(events, "conversation.item.retrieved").item["content"][0]["transcript"] == "abcd"
+        assert session.history_item_ids[item_id]["content"] == "abcd"
+    finally:
         await close_harness(h)
 
 
@@ -1598,6 +2003,81 @@ async def test_speech_after_silence_continuation_is_not_the_first_audio_window()
         payload = speech[0].prompt["model_intermediate_buffer"]["duplex"]["payload"]
         assert "first_audio_window" not in payload
         assert len(speech[0].prompt["prompt_token_ids"]) == 25
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_answer_continues_when_the_segment_end_arrives_before_the_answer() -> None:
+    """A continuation planned for the model turn is re-aimed at the answer that opened (#7729)."""
+    h = await open_harness()
+    try:
+        for _ in range(4):
+            await h.run(append_audio())
+        request_id = h.stage0_request_id()
+
+        # A TTS segment ends with no text or audio before any response exists.
+        # This schedules a continuation, which waits for up to one chunk period.
+        h.deliver(tts_output(request_id, samples=0, text="", tts_is_last_chunk=True))
+        await asyncio.sleep(0.1)
+
+        # During that wait the last real units arrive and the answer starts.
+        h.submit(append_audio())
+        await asyncio.sleep(0.1)
+        h.deliver(tts_output(request_id, samples=24000, text="no"))
+        await asyncio.sleep(0.1)
+        h.submit(append_audio())
+        h.submit(commands.Commit())
+        await h.settle(timeout_s=5.0)
+
+        # More of the answer. Its segment only ends after another unit is processed.
+        for samples, text in ((48000, "no fi"), (72000, "no fight, bu"), (96000, "no fight, but yes,")):
+            await h.deliver_and_settle(tts_output(request_id, samples=samples, text=text))
+        await h.settle(idle_s=2.5, timeout_s=8.0)
+
+        assert h.session.active_response_id is not None
+        # 6 real units, then a silence unit that keeps the answer going.
+        assert len(h.port.submissions) == 7
+        assert _is_silence_unit(h.port.submissions[6])
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_a_dropped_continuation_is_not_re_aimed_across_a_barge_in() -> None:
+    """The re-aim in #7729 stays inside the epoch that planned the unit.
+
+    The next answer must open while the old continuation is still waiting out
+    its chunk period, so this drives the runner with ``submit``/``deliver`` and
+    short sleeps. ``run``/``settle`` would wait for that continuation to drop
+    first, and then a fix that re-arms with the current epoch passes too.
+    """
+    h = await open_harness()
+    try:
+        for _ in range(2):
+            await h.run(append_audio())
+        request_id = h.stage0_request_id()
+
+        # Plan a continuation for the model turn of epoch 0. It waits for up to
+        # one chunk period (1 s) before it submits.
+        h.deliver(tts_output(request_id, samples=0, text="", tts_is_last_chunk=True))
+        await asyncio.sleep(0.1)
+
+        # The user barges in while it waits, and the next turn opens its own answer.
+        h.submit(commands.BargeIn())
+        await asyncio.sleep(0.1)
+        assert h.session.epoch == 1
+        h.submit(append_audio())
+        await asyncio.sleep(0.1)
+        assert any(task.get_name() == "duplex-continue" and not task.done() for task in h.runner._background_tasks), (
+            "the old continuation should still be waiting when the new answer opens"
+        )
+        h.deliver(tts_output(h.stage0_request_id(), samples=24000, text="hi", epoch=1))
+        await h.settle(idle_s=2.5, timeout_s=8.0)
+
+        assert h.session.epoch == 1
+        assert h.session.active_response_id is not None
+        assert [s for s in h.port.submissions if _is_silence_unit(s)] == []
     finally:
         await close_harness(h)
 
@@ -2870,6 +3350,67 @@ async def test_cancelling_output_keeps_the_pending_semantic_turn(command) -> Non
 
 
 @pytest.mark.asyncio
+async def test_response_cancel_keeps_a_commit_deferred_behind_the_active_response() -> None:
+    """Cancelling the answer in flight must not discard the next turn's audio.
+
+    A commit that arrives while a response is still generating is retained
+    with the response it should start. ``response.cancel`` then tears down only
+    the in-flight answer; the client's already-committed turn has to survive so
+    the ``response.create`` that follows can answer it.
+    """
+    h = await open_harness(auto_response=False)
+    try:
+        await h.run(append_audio())
+        await h.run(commands.Commit(create_response=True))
+        await h.deliver_and_settle(tts_output(h.stage0_request_id(), samples=24000, text="hello", finished=False))
+        assert h.runner.model_state.committed_audio_payload is None
+
+        await h.run(append_audio(samples=8000, value=0.07))
+        await h.run(commands.Commit(create_response=True))
+        model_state = h.runner.model_state
+        assert model_state.committed_audio_payload is not None
+        assert model_state.deferred_response_create is True
+
+        await h.run(commands.CancelResponse())
+        assert model_state.committed_audio_payload is not None, "the committed turn was discarded"
+        assert model_state.deferred_response_create is True
+        assert h.session.pending_input_bytes > 0
+
+        events = await h.run(commands.CreateResponse())
+        assert "error" not in types(events), types(events)
+        assert find(events, "response.created")
+        assert model_state.committed_audio_payload is None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_response_cancel_releases_audio_retained_for_the_cancelled_answer() -> None:
+    """A retain that belongs to the cancelled answer is still released."""
+    h = await open_harness(auto_response=False)
+    try:
+        await h.run(append_audio())
+        await h.run(commands.Commit(create_response=True))
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello", finished=False))
+        # Speech arriving mid-answer, committed without asking for a response:
+        # the retain belongs to the answer being generated, so
+        # ``deferred_response_create`` stays False and no new turn owns it.
+        await h.run(append_audio(samples=8000, value=0.07))
+        await h.run(commands.Commit(create_response=False))
+        model_state = h.runner.model_state
+        assert model_state.committed_audio_payload is not None
+        assert model_state.deferred_response_create is False
+
+        await h.run(commands.CancelResponse())
+
+        assert model_state.committed_audio_payload is None
+        assert h.session.pending_input_bytes == 0
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_auto_commit_does_not_reset_later_speech_in_the_same_append() -> None:
     h = await open_harness(auto_response=False)
     try:
@@ -3111,7 +3652,7 @@ async def test_input_clear_racing_a_queued_append_drops_it_as_the_clients_doing(
 
         h.port.submit_gate.set()
         events = await h.settle()
-        assert queued.done() and queued.result() is False, "the cleared append never ran"
+        assert queued.done() and queued.result() is True, "called off, not failed: later appends still run"
         assert len(h.port.submissions) == 1, "only the append that was already in flight reached the stage"
         assert [event.type for event in events if event.type in {"error", "response.done", "session.closed"}] == []
         assert h.session.pending_input_bytes == 0
